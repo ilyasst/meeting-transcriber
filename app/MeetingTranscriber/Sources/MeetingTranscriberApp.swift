@@ -75,6 +75,9 @@ struct MeetingTranscriberApp: App {
             .onReceive(NotificationCenter.default.publisher(for: .showSpeakerNaming)) { _ in
                 bringWindowToFront(id: "speaker-naming")
             }
+            .onOpenURL { url in
+                handleURL(url)
+            }
             .task {
                 switch appState.settings.transcriptionEngine {
                 case .whisperKit:
@@ -193,6 +196,56 @@ struct MeetingTranscriberApp: App {
     private func quit() {
         appState.watchLoop?.stop()
         NSApplication.shared.terminate(nil)
+    }
+
+    // MARK: - URL Scheme Handler (meeting-transcriber://)
+
+    /// Handles URLs opened via the `meeting-transcriber://` scheme.
+    ///
+    /// Supported URLs:
+    ///   meeting-transcriber://watch/start          — enable auto-watch
+    ///   meeting-transcriber://watch/stop           — disable auto-watch
+    ///   meeting-transcriber://record?app=Zoom      — start manual recording of a named app
+    ///   meeting-transcriber://process?file=<path>  — enqueue an audio/video file
+    private func handleURL(_ url: URL) {
+        guard url.scheme == "meeting-transcriber" else { return }
+        let host = url.host ?? ""
+        let path = url.path
+        let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+
+        switch host {
+        case "watch":
+            switch path {
+            case "/start":
+                if !appState.isWatching { appState.toggleWatching() }
+            case "/stop":
+                if appState.isWatching { appState.toggleWatching() }
+            default:
+                break
+            }
+
+        case "record":
+            if let appName = queryItems.first(where: { $0.name == "app" })?.value {
+                let running = NSWorkspace.shared.runningApplications
+                if let match = running.first(where: {
+                    $0.localizedName?.localizedCaseInsensitiveContains(appName) == true
+                }) {
+                    let pid = match.processIdentifier
+                    let name = match.localizedName ?? appName
+                    let title = queryItems.first(where: { $0.name == "title" })?.value ?? name
+                    appState.startManualRecording(pid: pid, appName: name, title: title)
+                }
+            }
+
+        case "process":
+            if let filePath = queryItems.first(where: { $0.name == "file" })?.value {
+                let fileURL = URL(fileURLWithPath: filePath)
+                appState.enqueueFiles([fileURL])
+            }
+
+        default:
+            break
+        }
     }
 
     // MARK: - Pure Helpers (testable without @main)
