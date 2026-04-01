@@ -37,6 +37,9 @@ struct PipelineJob: Identifiable, Codable {
     var warnings: [String]
     var transcriptPath: URL?
     var protocolPath: URL?
+    /// Per-job output directory override. When set, transcripts and protocols are written here
+    /// instead of the global output directory configured in AppSettings.
+    var outputDir: URL?
 
     init(
         meetingTitle: String,
@@ -46,6 +49,7 @@ struct PipelineJob: Identifiable, Codable {
         micPath: URL?,
         micDelay: TimeInterval,
         participants: [String] = [],
+        outputDir: URL? = nil,
     ) {
         self.id = UUID()
         self.meetingTitle = meetingTitle
@@ -61,5 +65,6 @@ struct PipelineJob: Identifiable, Codable {
         self.warnings = []
         self.transcriptPath = nil
         self.protocolPath = nil
+        self.outputDir = outputDir
     }
 }

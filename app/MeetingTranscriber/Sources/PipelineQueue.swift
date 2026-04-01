@@ -242,6 +242,7 @@ class PipelineQueue {
         let micPath = jobs[index].micPath
         let micDelay = jobs[index].micDelay
         let participants = jobs[index].participants
+        let effectiveOutputDir = jobs[index].outputDir ?? outputDir
 
         do {
             // --- Transcription ---
@@ -491,7 +492,7 @@ class PipelineQueue {
             }
 
             // --- Save Transcript & Audio (always) ---
-            let protocolsDir = outputDir.appendingPathComponent("protocols")
+            let protocolsDir = effectiveOutputDir.appendingPathComponent("protocols")
             let txtPath = try ProtocolGenerator.saveTranscript(finalTranscript, title: title, dir: protocolsDir)
             logger.info("Transcript saved: \(txtPath.lastPathComponent)")
 
@@ -499,7 +500,7 @@ class PipelineQueue {
                 jobs[idx].transcriptPath = txtPath
             }
 
-            let recordingsDir = outputDir.appendingPathComponent("recordings")
+            let recordingsDir = effectiveOutputDir.appendingPathComponent("recordings")
             Self.copyAudioToOutput(
                 mixPath: mixPath, appPath: appPath, micPath: micPath,
                 title: title, outputDir: recordingsDir,

@@ -234,7 +234,7 @@ final class AppState {
         watchLoop = nil
     }
 
-    func enqueueFiles(_ urls: [URL]) {
+    func enqueueFiles(_ urls: [URL], outputDir: URL? = nil) {
         ensurePipelineQueue()
 
         for url in urls {
@@ -246,6 +246,7 @@ final class AppState {
                 appPath: nil,
                 micPath: nil,
                 micDelay: 0,
+                outputDir: outputDir,
             )
             pipelineQueue.enqueue(job)
         }

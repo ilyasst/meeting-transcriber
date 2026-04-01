@@ -203,10 +203,13 @@ struct MeetingTranscriberApp: App {
     /// Handles URLs opened via the `meeting-transcriber://` scheme.
     ///
     /// Supported URLs:
-    ///   meeting-transcriber://watch/start          — enable auto-watch
-    ///   meeting-transcriber://watch/stop           — disable auto-watch
-    ///   meeting-transcriber://record?app=Zoom      — start manual recording of a named app
-    ///   meeting-transcriber://process?file=<path>  — enqueue an audio/video file
+    ///   meeting-transcriber://watch/start                        — enable auto-watch
+    ///   meeting-transcriber://watch/stop                         — disable auto-watch
+    ///   meeting-transcriber://record?app=Zoom                    — start manual recording of a named app
+    ///   meeting-transcriber://process?file=<path>                — enqueue an audio/video file
+    ///   meeting-transcriber://process?file=<path>&output=<dir>   — enqueue file, save results to custom dir
+    ///   meeting-transcriber://process?folder=<path>              — enqueue all audio/video files in a folder
+    ///   meeting-transcriber://process?folder=<path>&output=<dir> — enqueue folder, save results to custom dir
     private func handleURL(_ url: URL) {
         guard url.scheme == "meeting-transcriber" else { return }
         let host = url.host ?? ""
@@ -238,14 +241,37 @@ struct MeetingTranscriberApp: App {
             }
 
         case "process":
+            let outputDir = queryItems.first(where: { $0.name == "output" })
+                .flatMap { $0.value }
+                .map { URL(fileURLWithPath: $0, isDirectory: true) }
+
             if let filePath = queryItems.first(where: { $0.name == "file" })?.value {
                 let fileURL = URL(fileURLWithPath: filePath)
-                appState.enqueueFiles([fileURL])
+                appState.enqueueFiles([fileURL], outputDir: outputDir)
+            } else if let folderPath = queryItems.first(where: { $0.name == "folder" })?.value {
+                let folderURL = URL(fileURLWithPath: folderPath, isDirectory: true)
+                let files = audioVideoFiles(in: folderURL)
+                if !files.isEmpty {
+                    appState.enqueueFiles(files, outputDir: outputDir)
+                }
             }
 
         default:
             break
         }
+    }
+
+    /// Returns all audio/video files directly inside `folder` (non-recursive).
+    private func audioVideoFiles(in folder: URL) -> [URL] {
+        let supported: Set<String> = ["wav", "mp3", "m4a", "aiff", "aif", "mp4", "mov", "flac",
+                                      "mkv", "webm", "ogg"]
+        let fm = FileManager.default
+        guard let contents = try? fm.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: [.isRegularFileKey], options: .skipsHiddenFiles
+        ) else { return [] }
+        return contents
+            .filter { supported.contains($0.pathExtension.lowercased()) }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
     // MARK: - Pure Helpers (testable without @main)
