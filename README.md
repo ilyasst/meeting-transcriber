@@ -64,6 +64,7 @@ A native macOS menu bar app that automatically detects, records, transcribes, an
 - **Configurable protocol prompt** — Custom prompt file support (`~/Library/Application Support/MeetingTranscriber/protocol_prompt.md`)
 - **Manual recording** — Record any app via app picker, not just detected meetings
 - **Multi-format input** — Supports WAV, MP3, M4A, MP4, and with ffmpeg also MKV, WebM, OGG
+- **URL scheme** — Trigger the full pipeline programmatically from scripts, Shortcuts, Raycast, etc.
 - **Update checker** — Notifies when a new version is available
 - **Background processing** — PipelineQueue runs transcription and protocol generation independently from recording
 - **Distribution** — Install via Homebrew Cask or build from source
@@ -151,6 +152,40 @@ The app uses an animated waveform icon in the menu bar that reflects the current
 Launch the app — it sits in your menu bar. When a supported meeting is detected, recording starts automatically. When the meeting ends, the pipeline runs in the background: transcription → diarization → protocol generation.
 
 You can also batch-process existing audio and video files via the menu (⌘P) — supported formats: WAV, MP3, M4A, MP4 (and MKV, WebM, OGG when ffmpeg is installed).
+
+---
+
+## Programmatic Control (URL Scheme)
+
+The app registers the `meeting-transcriber://` URL scheme, allowing it to be driven from the terminal, shell scripts, macOS Shortcuts, Raycast, Alfred, or any tool that can open URLs.
+
+```bash
+# Enable / disable auto-watch
+open "meeting-transcriber://watch/start"
+open "meeting-transcriber://watch/stop"
+
+# Start manual recording of a running app (fuzzy name match)
+open "meeting-transcriber://record?app=Zoom"
+open "meeting-transcriber://record?app=Teams&title=Weekly+Standup"
+
+# Run the full pipeline on a single file
+open "meeting-transcriber://process?file=/path/to/meeting.wav"
+
+# Run the full pipeline on a single file, save results to a custom directory
+open "meeting-transcriber://process?file=/path/to/meeting.wav&output=/path/to/results"
+
+# Run the full pipeline on all audio/video files in a folder
+open "meeting-transcriber://process?folder=/path/to/recordings"
+
+# Folder input with custom output directory
+open "meeting-transcriber://process?folder=/path/to/recordings&output=/path/to/results"
+```
+
+**Supported input formats:** `.wav` `.mp3` `.m4a` `.aiff` `.mp4` `.mov` `.flac` — plus `.mkv` `.webm` `.ogg` when ffmpeg is installed.
+
+The `output=` parameter is per-job: concurrent jobs can each target a different output directory without touching global settings.
+
+If the app is not running when a URL is opened, macOS will launch it automatically before delivering the URL.
 
 ---
 
