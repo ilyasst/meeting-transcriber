@@ -427,6 +427,56 @@ class WatchLoop {
         }
     }
 
+    /// Single funnel through which every observable-field mutation flows.
+    /// Build the next snapshot, hand it to `apply` to commit only the
+    /// fields that actually changed, and let `apply` fire `onStateChange`
+    /// on a phase transition. Co-located mutations stay coherent
+    /// (a phase-change-plus-detail-update is one funnel call, not two
+    /// separate property writes that consumers could observe mid-flight).
+    private func update(_ transform: (inout WatchLoopState) -> Void) {
+        var next = snapshot
+        transform(&next)
+        apply(next)
+    }
+
+    /// Commit a new snapshot field-wise. Each `if old != new { old = new }`
+    /// guard avoids gratuitous `@Observable` invalidations for fields the
+    /// transform left alone; emit `onStateChange` if the phase moved.
+    private func apply(_ next: WatchLoopState) {
+        let oldPhase = state
+        if state != next.phase { state = next.phase }
+        if currentMeeting != next.currentMeeting { currentMeeting = next.currentMeeting }
+        if lastError != next.lastError { lastError = next.lastError }
+        if detail != next.detail { detail = next.detail }
+        if manualRecordingInfo != next.manualRecordingInfo {
+            manualRecordingInfo = next.manualRecordingInfo
+        }
+        if oldPhase != next.phase {
+            onStateChange?(oldPhase, next.phase)
+        }
+    }
+
+    /// Strip app suffixes from meeting titles for cleaner display.
+    static func cleanTitle(_ title: String) -> String {
+        let suffixes = [" | Microsoft Teams", " - Zoom", " - Webex"]
+        for suffix in suffixes where title.hasSuffix(suffix) {
+            return String(title.dropLast(suffix.count))
+        }
+        return title
+    }
+
+    /// Map WatchLoop state to TranscriberState for compatibility with existing UI.
+    var transcriberState: TranscriberState {
+        switch state {
+        case .idle: .idle
+        case .watching: .watching
+        case .recording: .recording
+        case .error: .error
+        }
+    }
+}
+
+extension WatchLoop {
     // MARK: - Helpers
 
     private func enqueueRecording(
@@ -535,85 +585,5 @@ class WatchLoop {
         try? FileManager.default.removeItem(at: dest)
         try FileManager.default.moveItem(at: source, to: dest)
         return dest
-    }
-
-    /// Single funnel through which every observable-field mutation flows.
-    /// Build the next snapshot, hand it to `apply` to commit only the
-    /// fields that actually changed, and let `apply` fire `onStateChange`
-    /// on a phase transition. Co-located mutations stay coherent
-    /// (a phase-change-plus-detail-update is one funnel call, not two
-    /// separate property writes that consumers could observe mid-flight).
-    private func update(_ transform: (inout WatchLoopState) -> Void) {
-        var next = snapshot
-        transform(&next)
-        apply(next)
-    }
-
-    /// Commit a new snapshot field-wise. Each `if old != new { old = new }`
-    /// guard avoids gratuitous `@Observable` invalidations for fields the
-    /// transform left alone; emit `onStateChange` if the phase moved.
-    private func apply(_ next: WatchLoopState) {
-        let oldPhase = state
-        if state != next.phase { state = next.phase }
-        if currentMeeting != next.currentMeeting { currentMeeting = next.currentMeeting }
-        if lastError != next.lastError { lastError = next.lastError }
-        if detail != next.detail { detail = next.detail }
-        if manualRecordingInfo != next.manualRecordingInfo {
-            manualRecordingInfo = next.manualRecordingInfo
-        }
-        if oldPhase != next.phase {
-            onStateChange?(oldPhase, next.phase)
-        }
-    }
-
-    /// Strip app suffixes from meeting titles for cleaner display.
-    static func cleanTitle(_ title: String) -> String {
-        let suffixes = [" | Microsoft Teams", " - Zoom", " - Webex"]
-        for suffix in suffixes where title.hasSuffix(suffix) {
-            return String(title.dropLast(suffix.count))
-        }
-        return title
-    }
-
-    /// Map WatchLoop state to TranscriberState for compatibility with existing UI.
-    var transcriberState: TranscriberState {
-        switch state {
-        case .idle: .idle
-        case .watching: .watching
-        case .recording: .recording
-        case .error: .error
-        }
-    }
-}
-
-/// Pair of URLs used by `WatchLoop` when persisting record-only output: the
-/// `scope` URL is what `startAccessingSecurityScopedResource()` is called on
-/// (the bookmark-resolved parent the user actually picked), and `writeDir` is
-/// the sub-path under that scope where the WAV + sidecar files land.
-///
-/// The split exists because Apple's security-scoped-bookmark API only grants
-/// access on the URL that resolved from the bookmark — calling start-access
-/// on a *child* path silently fails inside the App Store sandbox while
-/// appearing to work in the unsandboxed Homebrew build. The factory methods
-/// below make the two cases (real bookmark vs. transient app dir) explicit
-/// at every call site.
-struct RecordOnlyDestination: Equatable {
-    let scope: URL
-    let writeDir: URL
-
-    /// Production path: `parent` is the user-picked Output Folder (potentially
-    /// resolved from a security-scoped bookmark) and the WAVs land under
-    /// `parent/recordings/` so a Syncthing or rsync pair has a stable subtree.
-    static func production(parent: URL) -> Self {
-        Self(
-            scope: parent,
-            writeDir: parent.appendingPathComponent("recordings", isDirectory: true),
-        )
-    }
-
-    /// Test/default path: no security scope to manage — `scope == writeDir`,
-    /// so start-access is a harmless no-op and the writer hits `url` directly.
-    static func unscoped(_ url: URL) -> Self {
-        Self(scope: url, writeDir: url)
     }
 }
