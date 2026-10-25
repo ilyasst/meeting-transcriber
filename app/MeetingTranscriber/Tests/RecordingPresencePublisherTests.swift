@@ -133,6 +133,25 @@ final class RecordingPresencePublisherTests: XCTestCase {
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).isEmpty)
     }
 
+    func testFailedExportRemovesTheActiveSignal() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let recorder = MockRecorder()
+        recorder.presenceFilename = "fixture_mix.wav"
+        recorder.mixPath = root.appendingPathComponent("missing_mix.wav")
+        let loop = WatchLoop(
+            detector: makeSilentDetector(), recorderFactory: { recorder },
+            recordOnly: { true }, recordOnlyDestination: { .unscoped(root.appendingPathComponent("recordings")) },
+            pidAliveCheck: { _ in true },
+        )
+        loop.permissionChecker = { HealthCheckResult(screenRecording: .healthy, microphone: .healthy) }
+        try await loop.startManualRecording(pid: 9999, appName: "Fixture", title: "Synthetic capture")
+        loop.stopManualRecording()
+        let directory = root.appendingPathComponent("intake/recorder-presence")
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).isEmpty)
+    }
+
     private func document(_ url: URL) throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
     }
