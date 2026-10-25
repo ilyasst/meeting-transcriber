@@ -60,11 +60,8 @@ struct MenuBarView: View {
         }
     }
 
-    var body: some View {
-        statusHeader()
-
-        Divider()
-
+    @ViewBuilder
+    private func recordingControls() -> some View {
         // Start/Stop Watching
         Button {
             onStartStop()
@@ -108,21 +105,10 @@ struct MenuBarView: View {
             Label("Process Audio/Video Files...", systemImage: "doc.badge.plus")
         }
         .keyboardShortcut("p")
+    }
 
-        // Processing queue
-        if !pipelineQueue.jobs.isEmpty {
-            Divider()
-            Label("Processing", systemImage: "gearshape.2.fill")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            ForEach(pipelineQueue.jobs) { job in
-                jobRow(job)
-            }
-        }
-
-        Divider()
-
+    @ViewBuilder
+    private func protocolControls() -> some View {
         // Open last protocol
         if let protocolPath = status?.protocolPath {
             Button {
@@ -151,6 +137,30 @@ struct MenuBarView: View {
                 )
             }
         }
+    }
+
+    var body: some View {
+        statusHeader()
+
+        Divider()
+
+        recordingControls()
+
+        // Processing queue
+        if !pipelineQueue.jobs.isEmpty {
+            Divider()
+            Label("Processing", systemImage: "gearshape.2.fill")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ForEach(pipelineQueue.jobs) { job in
+                jobRow(job)
+            }
+        }
+
+        Divider()
+
+        protocolControls()
 
         Divider()
 

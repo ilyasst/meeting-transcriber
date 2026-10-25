@@ -88,6 +88,7 @@ jobs:
         run: brew install swiftlint
       - name: Build & Analyze
         run: |
+          set -o pipefail
           cd app/MeetingTranscriber
           xcodebuild -scheme MeetingTranscriber -destination 'platform=macOS' build-for-testing 2>&1 | tee /tmp/xcodebuild.log
           cd "$GITHUB_WORKSPACE"
