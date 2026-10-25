@@ -7,8 +7,8 @@ private let presenceLogger = Logger(subsystem: AppPaths.logSubsystem, category: 
 @MainActor
 final class RecordingPresencePublisher {
     private struct Document: Encodable {
-        let schema = "shalashaska.recorder-presence"
-        let schema_version = 1 // swiftlint:disable:this identifier_name
+        let schema: String
+        let schema_version: Int // swiftlint:disable:this identifier_name
         let filename: String
         let status: String
         let started_at: String // swiftlint:disable:this identifier_name
@@ -86,6 +86,7 @@ final class RecordingPresencePublisher {
     private func publish(status: String, filename: String) {
         lastUpdate = max(lastUpdate, clock())
         let document = Document(
+            schema: "shalashaska.recorder-presence", schema_version: 1,
             filename: filename, status: status,
             started_at: formatter.string(from: startedAt), updated_at: formatter.string(from: lastUpdate),
         )
