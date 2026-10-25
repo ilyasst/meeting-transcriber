@@ -1,0 +1,25 @@
+name: Recorder presence validation
+
+on:
+  push:
+    branches: [feat/recorder-presence]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  swift-tests:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-swift-test
+        with:
+          cache-key-suffix: recorder-presence
+      - name: Complete Swift test suite
+        working-directory: app/MeetingTranscriber
+        run: swift test --parallel
+      - name: Audio capture library tests
+        working-directory: tools/audiotap
+        run: swift test --parallel

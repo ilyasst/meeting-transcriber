@@ -36,6 +36,8 @@ class WatchLoop {
     /// this class only.
     private(set) var activeRecorder: (any RecordingProvider)?
     private var manualRecordingTask: Task<Void, Never>?
+    private var manualPresence: RecordingPresencePublisher?
+    private var manualRecordOnlyDestination: RecordOnlyDestination?
 
     var isManualRecording: Bool {
         manualRecordingInfo != nil
@@ -180,6 +182,16 @@ class WatchLoop {
         logger.info("Watch mode stopped")
     }
 
+    private func capturePresence(
+        for recorder: any RecordingProvider,
+        destination: RecordOnlyDestination?,
+    ) -> RecordingPresencePublisher? {
+        guard let destination, let filename = recorder.presenceFilename else { return nil }
+        let directory = destination.writeDir.deletingLastPathComponent()
+            .appendingPathComponent("intake/recorder-presence", isDirectory: true)
+        return RecordingPresencePublisher(scope: destination.scope, directory: directory, filename: filename)
+    }
+
     // MARK: - Manual Recording
 
     func startManualRecording(pid: pid_t, appName: String, title: String) async throws {
@@ -203,6 +215,8 @@ class WatchLoop {
             debugLogging: verboseDiagnostics(),
         )
 
+        manualRecordOnlyDestination = recordOnly() ? recordOnlyDestination() : nil
+        manualPresence = capturePresence(for: recorder, destination: manualRecordOnlyDestination)
         activeRecorder = recorder
         update { next in
             next.phase = .recording
@@ -227,12 +241,19 @@ class WatchLoop {
         var failureMessage: String?
         do {
             let recording = try recorder.stop()
-            enqueueRecording(title: info.title, appName: info.appName, recording: recording)
+            enqueueRecording(
+                title: info.title, appName: info.appName, recording: recording,
+                destination: manualRecordOnlyDestination,
+            )
+            manualPresence?.stopped(filename: recording.mixPath.lastPathComponent)
         } catch {
             logger.error("Failed to stop manual recording: \(error)")
             failureMessage = error.localizedDescription
         }
 
+        manualPresence?.cancelled()
+        manualPresence = nil
+        manualRecordOnlyDestination = nil
         activeRecorder = nil
         update { next in
             next.phase = .idle
@@ -328,7 +349,12 @@ class WatchLoop {
             debugLogging: verboseDiagnostics(),
         )
         activeRecorder = recorder
-        defer { activeRecorder = nil }
+        let destination = recordOnly() ? recordOnlyDestination() : nil
+        let presence = capturePresence(for: recorder, destination: destination)
+        defer {
+            presence?.cancelled()
+            activeRecorder = nil
+        }
 
         // Read participants (Teams)
         var participants: [String] = []
@@ -363,7 +389,9 @@ class WatchLoop {
             appName: meeting.pattern.appName,
             recording: recording,
             participants: participants,
+            destination: destination,
         )
+        presence?.stopped(filename: recording.mixPath.lastPathComponent)
     }
 
     // MARK: - Meeting End Detection
@@ -406,13 +434,15 @@ class WatchLoop {
         appName: String,
         recording: RecordingResult,
         participants: [String] = [],
+        destination: RecordOnlyDestination? = nil,
     ) {
-        if recordOnly() {
+        if let destination {
             writeRecordOnlySidecar(
                 title: title,
                 appName: appName,
                 recording: recording,
                 participants: participants,
+                destination: destination,
             )
             return
         }
@@ -442,6 +472,7 @@ class WatchLoop {
         appName: String,
         recording: RecordingResult,
         participants: [String],
+        destination: RecordOnlyDestination,
     ) {
         let stoppedAt = Date()
         let startedAt = wallClockDate(forUptime: recording.recordingStart, now: stoppedAt)
@@ -451,7 +482,6 @@ class WatchLoop {
             ?? recording.mixPath.deletingPathExtension().lastPathComponent
 
         do {
-            let destination = recordOnlyDestination()
             // start/stopAccessingSecurityScopedResource MUST be called on the
             // URL that resolved from the bookmark (App Store sandboxed build,
             // or any custom Output Folder pick) — calling it on a child path
