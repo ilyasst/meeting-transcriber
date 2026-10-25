@@ -12,6 +12,19 @@ protocol TranscribingEngine: AnyObject {
     func transcribeSegments(audioPath: URL) async throws -> [TimestampedSegment]
 }
 
+/// Engines that can transcribe an already-decoded `[Float]` buffer of
+/// 16 kHz mono samples in memory — the API the live-transcription
+/// pipeline feeds with VAD-bounded chunks straight off the audio tap.
+///
+/// Engines that can't do in-memory transcription (currently Qwen3, whose
+/// FluidAudio backend is chunk-batch-only) simply don't conform. The
+/// caller's `as? StreamingTranscribingEngine` cast is the static
+/// equivalent of `TranscriptionEngineSetting.supportsLiveTranscription`.
+@MainActor
+protocol StreamingTranscribingEngine: TranscribingEngine {
+    func transcribeSamples(_ samples: [Float]) async throws -> String
+}
+
 extension TranscribingEngine {
     /// Label and merge pre-transcribed app/mic segments by timestamp.
     func mergeDualSourceSegments(
@@ -35,7 +48,7 @@ extension TranscribingEngine {
         }
 
         for i in app.indices {
-            app[i].speaker = "Remote"
+            app[i].speaker = DiarizationProcess.remoteSpeakerLabel
         }
         for i in mic.indices {
             mic[i].speaker = micLabel

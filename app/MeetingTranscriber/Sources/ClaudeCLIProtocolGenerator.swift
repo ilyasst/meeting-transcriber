@@ -23,30 +23,16 @@
         // MARK: - ProtocolGenerating
 
         func generate(transcript: String, title _: String, diarized: Bool) async throws -> String {
-            var prompt = ProtocolGenerator.applyLanguage(ProtocolGenerator.loadPrompt(), language: language)
-            if diarized {
-                prompt += ProtocolGenerator.diarizationNote
-            }
-            prompt += transcript
+            let prompt = ProtocolGenerator.buildSystemPrompt(diarized: diarized, language: language) + transcript
 
             let process = Process()
             let resolvedBin = Self.resolveClaudePath(claudeBin)
             process.executableURL = URL(fileURLWithPath: resolvedBin)
-            var args = ["-p", "-", "--output-format", "stream-json", "--verbose", "--model", "sonnet"]
-            // If using /usr/bin/env fallback, prepend the binary name
-            if resolvedBin == "/usr/bin/env" {
-                args.insert(claudeBin, at: 0)
-            }
-            process.arguments = args
-
-            // Remove CLAUDECODE env var to allow nested Claude CLI invocation
-            var env = ProcessInfo.processInfo.environment
-            env.removeValue(forKey: "CLAUDECODE")
-            // App bundles have a minimal PATH — ensure common bin dirs are included
-            // so wrapper scripts (e.g. claude-work-wrapper calling `exec claude`) work
-            let extraPaths = Self.searchPaths.joined(separator: ":")
-            env["PATH"] = "\(extraPaths):\(env["PATH"] ?? "/usr/bin:/bin")"
-            process.environment = env
+            process.arguments = Self.buildSubprocessArgs(claudeBin: claudeBin, resolvedBin: resolvedBin)
+            process.environment = Self.buildEnvironment(
+                baseEnvironment: ProcessInfo.processInfo.environment,
+                searchPaths: Self.searchPaths,
+            )
 
             let stdinPipe = Pipe()
             let stdoutPipe = Pipe()
@@ -55,7 +41,7 @@
             process.standardOutput = stdoutPipe
             process.standardError = stderrPipe
 
-            // C5 fix: Set terminationHandler BEFORE process.run() to avoid race
+            // Set terminationHandler BEFORE process.run() to avoid race
             // where the process exits before the handler is installed.
             // AsyncStream buffers the yield, so even if the process exits before
             // we iterate, the value is not lost.
@@ -69,23 +55,39 @@
             do {
                 try process.run()
             } catch {
+                logger.error(
+                    "claude_cli_not_found bin=\(self.claudeBin, privacy: .public) resolvedPath=\(resolvedBin, privacy: .public) error=\(error.localizedDescription, privacy: .public)",
+                )
                 throw ProtocolError.cliNotFound(claudeBin)
             }
 
-            // C5 fix: Guard against process having already exited before we awaited.
+            // Guard against process having already exited before we awaited.
             // If the process already exited, terminationHandler may have already fired,
             // but AsyncStream buffers the yield so we won't miss it.
             // No additional check needed — AsyncStream handles the race.
 
-            logger.info("Generating protocol with Claude CLI ...")
-
-            // C6 fix: Write stdin in a detached task to avoid deadlock on large transcripts.
+            // Write stdin in a detached task to avoid deadlock on large transcripts.
             // The pipe buffer is finite (~64KB); if the prompt exceeds it, a synchronous
             // write blocks until the reader drains — but we haven't started reading yet.
             let promptData = Data(prompt.utf8)
+            logger.info("claude_cli_subprocess_start prompt_bytes=\(promptData.count, privacy: .public)")
             let stdinWriteTask = Task.detached {
-                stdinPipe.fileHandleForWriting.write(promptData)
-                stdinPipe.fileHandleForWriting.closeFile()
+                // Use the throwing `write(contentsOf:)` rather than the deprecated
+                // `write(_:)`: the latter raises an uncatchable Obj-C NSException on
+                // a write error (e.g. EPIPE when the child's stdin read end has
+                // closed — which happens on the timeout path where readStreamJSON
+                // calls process.terminate()), aborting the whole app. The throwing
+                // API turns a broken pipe into a handled Swift error so we can log
+                // and fall through to close the handle. Mirrors the write sites in
+                // RecognitionStats and PersistentDiagnosticLog.
+                do {
+                    try stdinPipe.fileHandleForWriting.write(contentsOf: promptData)
+                } catch {
+                    logger.debug(
+                        "claude_cli_stdin_write_failed error=\(error.localizedDescription, privacy: .public)",
+                    )
+                }
+                try? stdinPipe.fileHandleForWriting.close()
             }
 
             // Read stream-json output concurrently with stdin write
@@ -106,15 +108,28 @@
 
             if process.terminationStatus != 0 {
                 let stderrData = await stderrRead
-                let stderrText = String(data: stderrData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                throw ProtocolError.cliFailed(Int(process.terminationStatus), stderrText)
+                let stderrText = String(data: stderrData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                logger.error(
+                    "claude_cli_failed exit=\(process.terminationStatus, privacy: .public) stderr=\(stderrText, privacy: .public)",
+                )
+                throw Self.makeFailureError(exitCode: process.terminationStatus, stderrText: stderrText)
             }
 
+            return try Self.validateGeneratedText(text)
+        }
+
+        /// Pair an already-decoded stderr string with `exitCode` as a
+        /// `ProtocolError.cliFailed`.
+        static func makeFailureError(exitCode: Int32, stderrText: String) -> ProtocolError {
+            .cliFailed(Int(exitCode), stderrText)
+        }
+
+        /// Trim whitespace from CLI output. Throws `.emptyProtocol` when
+        /// the subprocess exited successfully but produced no usable text.
+        static func validateGeneratedText(_ text: String) throws -> String {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else {
-                throw ProtocolError.emptyProtocol
-            }
-
+            guard !trimmed.isEmpty else { throw ProtocolError.emptyProtocol }
             return trimmed
         }
 
@@ -130,34 +145,52 @@
             var buffer = Data()
             while true {
                 if ProcessInfo.processInfo.systemUptime - startTime > timeoutSeconds {
+                    let elapsed = ProcessInfo.processInfo.systemUptime - startTime
+                    let elapsedStr = String(format: "%.1f", elapsed)
+                    logger.error(
+                        "claude_cli_timeout elapsed=\(elapsedStr, privacy: .public)s parts_received=\(parts.count, privacy: .public)",
+                    )
                     process.terminate()
                     throw ProtocolError.timeout
                 }
 
-                // I1 fix: Wrap blocking availableData in Task.detached to avoid
+                // Wrap blocking availableData in Task.detached to avoid
                 // blocking Swift's cooperative thread pool. availableData blocks
                 // until data is available or EOF, which would starve other tasks.
                 let chunk = await Task.detached { handle.availableData }.value
                 if chunk.isEmpty { break } // EOF
 
                 buffer.append(chunk)
-
-                // Process complete lines
-                while let newlineRange = buffer.range(of: Data([0x0A])) {
-                    let lineData = buffer[buffer.startIndex ..< newlineRange.lowerBound]
-                    buffer.removeSubrange(buffer.startIndex ... newlineRange.lowerBound)
-
-                    guard let line = String(data: lineData, encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines),
-                        !line.isEmpty else { continue }
-
-                    if let text = parseStreamJSONLine(line) {
-                        parts.append(text)
-                    }
-                }
+                parts.append(contentsOf: drainStreamJSONLines(buffer: &buffer))
             }
 
             return parts.joined()
+        }
+
+        /// Drain every newline-terminated line currently in `buffer`, parsing
+        /// each via `parseStreamJSONLine`. Returns the extracted text
+        /// fragments in order. Lines that are empty after trimming, lines
+        /// that don't decode as UTF-8, and lines that `parseStreamJSONLine`
+        /// rejects are silently skipped.
+        ///
+        /// Trailing bytes without a terminating newline stay in `buffer`
+        /// for the next call to consume — the caller must keep the buffer
+        /// across iterations.
+        static func drainStreamJSONLines(buffer: inout Data) -> [String] {
+            var fragments: [String] = []
+            while let newlineIdx = buffer.firstIndex(of: 0x0A) {
+                let lineData = buffer[buffer.startIndex ..< newlineIdx]
+                buffer.removeSubrange(buffer.startIndex ... newlineIdx)
+
+                guard let line = String(data: lineData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                    !line.isEmpty else { continue }
+
+                if let text = parseStreamJSONLine(line) {
+                    fragments.append(text)
+                }
+            }
+            return fragments
         }
 
         /// Parse a single stream-json line and extract text content.
@@ -224,6 +257,33 @@
             }
             // Fallback: hope it's in PATH
             return "/usr/bin/env"
+        }
+
+        // MARK: - Pure subprocess builders
+
+        /// Build the CLI argument vector. When `resolvedBin` is the
+        /// `/usr/bin/env` fallback, prepend `claudeBin` so env can resolve
+        /// it from PATH.
+        static func buildSubprocessArgs(claudeBin: String, resolvedBin: String) -> [String] {
+            var args = ["-p", "-", "--output-format", "stream-json", "--verbose", "--model", "sonnet"]
+            if resolvedBin == "/usr/bin/env" {
+                args.insert(claudeBin, at: 0)
+            }
+            return args
+        }
+
+        /// Strip `CLAUDECODE` (avoid nested-session detection by the child
+        /// CLI) and prepend `searchPaths` to `PATH` (app bundles inherit
+        /// a minimal `PATH`).
+        static func buildEnvironment(
+            baseEnvironment: [String: String],
+            searchPaths: [String],
+        ) -> [String: String] {
+            var env = baseEnvironment
+            env.removeValue(forKey: "CLAUDECODE")
+            let extraPaths = searchPaths.joined(separator: ":")
+            env["PATH"] = "\(extraPaths):\(env["PATH"] ?? "/usr/bin:/bin")"
+            return env
         }
     }
 

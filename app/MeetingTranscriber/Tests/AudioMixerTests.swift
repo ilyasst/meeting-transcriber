@@ -124,9 +124,7 @@ final class AudioMixerTests: XCTestCase {
     // MARK: - WAV Round-trip
 
     func testWAVRoundTrip() throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-        let wavURL = tmpDir.appendingPathComponent("test_roundtrip_\(UUID().uuidString).wav")
-        defer { try? FileManager.default.removeItem(at: wavURL) }
+        let wavURL = makeTempFile(suffix: ".wav")
 
         let original: [Float] = [0.0, 0.5, -0.5, 0.25, -0.25]
         let sampleRate = 16000
@@ -142,9 +140,7 @@ final class AudioMixerTests: XCTestCase {
     }
 
     func testSaveWAVCreatesFile() throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-        let wavURL = tmpDir.appendingPathComponent("test_create_\(UUID().uuidString).wav")
-        defer { try? FileManager.default.removeItem(at: wavURL) }
+        let wavURL = makeTempFile(suffix: ".wav")
 
         let samples = [Float](repeating: 0, count: 48000) // 1 second silence
         try AudioMixer.saveWAV(samples: samples, sampleRate: 48000, url: wavURL)
@@ -155,12 +151,20 @@ final class AudioMixerTests: XCTestCase {
         XCTAssertGreaterThan(size, 44) // WAV header is 44 bytes minimum
     }
 
+    func testSaveWAVSetsOwnerOnlyPermissions() throws {
+        let wavURL = makeTempFile(suffix: ".wav")
+
+        try AudioMixer.saveWAV(samples: [0.0, 0.5, -0.5], sampleRate: 16000, url: wavURL)
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: wavURL.path)
+        let perms = attrs[.posixPermissions] as? Int
+        XCTAssertEqual(perms, 0o600, "Audio files must be owner-only (0600)")
+    }
+
     // MARK: - Multi-format Loading
 
     func testLoadAudioAsFloat32WAV() async throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-        let wavURL = tmpDir.appendingPathComponent("test_multiformat_\(UUID().uuidString).wav")
-        defer { try? FileManager.default.removeItem(at: wavURL) }
+        let wavURL = makeTempFile(suffix: ".wav")
 
         let original: [Float] = [0.0, 0.5, -0.5, 0.25, -0.25]
         try AudioMixer.saveWAV(samples: original, sampleRate: 16000, url: wavURL)
@@ -174,9 +178,7 @@ final class AudioMixerTests: XCTestCase {
     }
 
     func testLoadAudioAsFloat32RoundTrip() async throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-        let wavURL = tmpDir.appendingPathComponent("test_async_roundtrip_\(UUID().uuidString).wav")
-        defer { try? FileManager.default.removeItem(at: wavURL) }
+        let wavURL = makeTempFile(suffix: ".wav")
 
         let original: [Float] = [0.1, -0.1, 0.3, -0.3, 0.0]
         try AudioMixer.saveWAV(samples: original, sampleRate: 44100, url: wavURL)
@@ -190,8 +192,7 @@ final class AudioMixerTests: XCTestCase {
     }
 
     func testLoadAudioAsFloat32NonexistentFile() async {
-        let bogus = FileManager.default.temporaryDirectory
-            .appendingPathComponent("nonexistent_\(UUID().uuidString).wav")
+        let bogus = makeTempFile(suffix: ".wav")
         do {
             _ = try await AudioMixer.loadAudioAsFloat32(url: bogus)
             XCTFail("Expected error for nonexistent file")
@@ -201,13 +202,8 @@ final class AudioMixerTests: XCTestCase {
     }
 
     func testResampleFileAsyncRoundTrip() async throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-        let src = tmpDir.appendingPathComponent("test_resample_src_\(UUID().uuidString).wav")
-        let dst = tmpDir.appendingPathComponent("test_resample_dst_\(UUID().uuidString).wav")
-        defer {
-            try? FileManager.default.removeItem(at: src)
-            try? FileManager.default.removeItem(at: dst)
-        }
+        let src = makeTempFile(suffix: ".wav")
+        let dst = makeTempFile(suffix: ".wav")
 
         // Create a 48kHz source (480 samples = 10ms)
         let samples48k = [Float](repeating: 0.5, count: 480)
@@ -222,13 +218,6 @@ final class AudioMixerTests: XCTestCase {
     }
 
     // MARK: - Multi-format Fixtures
-
-    private func fixtureURL(_ name: String) -> URL {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures")
-            .appendingPathComponent(name)
-    }
 
     // -- Loading (AVAudioFile fast path) --
 
@@ -291,9 +280,7 @@ final class AudioMixerTests: XCTestCase {
 
     func testResampleFileM4A44kTo16k() async throws {
         let src = fixtureURL("sine_440hz_44k.m4a")
-        let dst = FileManager.default.temporaryDirectory
-            .appendingPathComponent("test_resample_m4a_\(UUID().uuidString).wav")
-        defer { try? FileManager.default.removeItem(at: dst) }
+        let dst = makeTempFile(suffix: ".wav")
 
         try await AudioMixer.resampleFile(from: src, to: dst, targetRate: 16000)
 
@@ -307,9 +294,7 @@ final class AudioMixerTests: XCTestCase {
 
     func testResampleFileMP3_44kTo16k() async throws {
         let src = fixtureURL("sine_440hz_44k.mp3")
-        let dst = FileManager.default.temporaryDirectory
-            .appendingPathComponent("test_resample_mp3_\(UUID().uuidString).wav")
-        defer { try? FileManager.default.removeItem(at: dst) }
+        let dst = makeTempFile(suffix: ".wav")
 
         try await AudioMixer.resampleFile(from: src, to: dst, targetRate: 16000)
 
@@ -324,9 +309,7 @@ final class AudioMixerTests: XCTestCase {
 
     func testResampleFileDurationPreserved() async throws {
         let src = fixtureURL("sine_440hz_44k.m4a")
-        let dst = FileManager.default.temporaryDirectory
-            .appendingPathComponent("test_duration_\(UUID().uuidString).wav")
-        defer { try? FileManager.default.removeItem(at: dst) }
+        let dst = makeTempFile(suffix: ".wav")
 
         try await AudioMixer.resampleFile(from: src, to: dst, targetRate: 16000)
 
@@ -339,15 +322,17 @@ final class AudioMixerTests: XCTestCase {
 
     func testResampleFileAudioHasEnergy() async throws {
         let src = fixtureURL("sine_440hz_44k.m4a")
-        let dst = FileManager.default.temporaryDirectory
-            .appendingPathComponent("test_energy_\(UUID().uuidString).wav")
-        defer { try? FileManager.default.removeItem(at: dst) }
+        let dst = makeTempFile(suffix: ".wav")
 
         try await AudioMixer.resampleFile(from: src, to: dst, targetRate: 16000)
 
         let loaded = try AudioMixer.loadAudioFileAsFloat32(url: dst)
-        // Sine wave should have significant energy (not silence)
-        let rms = sqrt(loaded.map { $0 * $0 }.reduce(0, +) / Float(loaded.count))
+        // Sine wave should have significant energy (not silence). Typed-binding
+        // split — see WhisperKitE2ETests.testResamplePreservesSignalEnergy for the
+        // type-check-time rationale.
+        let loadedSquared: [Float] = loaded.map { $0 * $0 }
+        let loadedSum: Float = loadedSquared.reduce(0, +)
+        let rms: Float = sqrt(loadedSum / Float(loaded.count))
         // AAC encoding + 16-bit quantization reduce amplitude; 0.05 confirms it's not silence
         XCTAssertGreaterThan(rms, 0.05, "Resampled audio should not be silent")
     }
@@ -410,13 +395,8 @@ final class AudioMixerTests: XCTestCase {
     }
 
     func testResampleFilePreservesFrequency() async throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-        let src = tmpDir.appendingPathComponent("test_freq_src_\(UUID().uuidString).wav")
-        let dst = tmpDir.appendingPathComponent("test_freq_dst_\(UUID().uuidString).wav")
-        defer {
-            try? FileManager.default.removeItem(at: src)
-            try? FileManager.default.removeItem(at: dst)
-        }
+        let src = makeTempFile(suffix: ".wav")
+        let dst = makeTempFile(suffix: ".wav")
 
         // 440Hz sine at 48kHz, save to WAV, resample file to 16kHz
         let input = Self.generateSine(frequency: 440, sampleRate: 48000, duration: 1.0)
@@ -431,11 +411,8 @@ final class AudioMixerTests: XCTestCase {
     }
 
     func testSaveWAVHeaderSampleRateCorrect() throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-
         for rate in [48000, 16000, 44100] {
-            let url = tmpDir.appendingPathComponent("test_header_\(rate)_\(UUID().uuidString).wav")
-            defer { try? FileManager.default.removeItem(at: url) }
+            let url = makeTempFile(suffix: ".wav")
 
             let samples = [Float](repeating: 0, count: rate) // 1s silence
             try AudioMixer.saveWAV(samples: samples, sampleRate: rate, url: url)
@@ -450,9 +427,7 @@ final class AudioMixerTests: XCTestCase {
 
     func testResampleFileFromM4APreservesFrequency() async throws {
         let src = fixtureURL("sine_440hz_44k.m4a")
-        let dst = FileManager.default.temporaryDirectory
-            .appendingPathComponent("test_freq_m4a_\(UUID().uuidString).wav")
-        defer { try? FileManager.default.removeItem(at: dst) }
+        let dst = makeTempFile(suffix: ".wav")
 
         try await AudioMixer.resampleFile(from: src, to: dst, targetRate: 16000)
 
@@ -460,6 +435,40 @@ final class AudioMixerTests: XCTestCase {
         let peak = Self.peakFrequency(samples: loaded, sampleRate: 16000)
 
         XCTAssertEqual(peak, 440, accuracy: 440 * 0.05, "M4A→16k must preserve 440Hz (got \(peak)Hz)")
+    }
+
+    // MARK: - RMS
+
+    func test_rmsDecibels_emptyBuffer_returnsNegativeInfinity() {
+        XCTAssertEqual(AudioMixer.rmsDecibels(samples: []), -.infinity)
+    }
+
+    func test_rmsDecibels_silentBuffer_isVeryLow() {
+        let silent = [Float](repeating: 0, count: 1024)
+        let rms = AudioMixer.rmsDecibels(samples: silent)
+        XCTAssertLessThan(rms, -190, "Silent buffer should be ~-200 dBFS, got \(rms)")
+    }
+
+    func test_rmsDecibels_fullScaleSine_isAroundMinus3() {
+        let sine = Self.generateSine(frequency: 440, sampleRate: 16000, duration: 0.5)
+        let rms = AudioMixer.rmsDecibels(samples: sine)
+        XCTAssertEqual(rms, -3, accuracy: 0.5, "Full-scale sine RMS should be ~-3 dBFS, got \(rms)")
+    }
+
+    func test_rmsDecibels_forFileAt_silentWAV() throws {
+        let tmpURL = makeTempFile(suffix: ".wav")
+
+        let silent = [Float](repeating: 0, count: 16000)
+        try AudioMixer.saveWAV(samples: silent, sampleRate: 16000, url: tmpURL)
+
+        let rms = AudioMixer.rmsDecibels(forFileAt: tmpURL)
+        XCTAssertNotNil(rms)
+        XCTAssertLessThan(rms ?? 0, -190)
+    }
+
+    func test_rmsDecibels_forFileAt_missingFile_returnsNil() {
+        let bogus = URL(fileURLWithPath: "/tmp/does-not-exist-\(UUID().uuidString).wav")
+        XCTAssertNil(AudioMixer.rmsDecibels(forFileAt: bogus))
     }
 }
 

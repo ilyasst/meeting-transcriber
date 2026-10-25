@@ -9,6 +9,8 @@ cask "meeting-transcriber" do
 
   depends_on macos: ">= :sonoma"
 
+  conflicts_with cask: "meeting-transcriber@beta"
+
   app "MeetingTranscriber.app"
 
   zap trash: [

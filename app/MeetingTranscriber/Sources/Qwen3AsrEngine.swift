@@ -1,6 +1,9 @@
 import FluidAudio
 import Foundation
+import os.log
 import WhisperKit
+
+private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "Qwen3AsrEngine")
 
 /// Transcription engine backed by Qwen3-ASR 0.6B via FluidAudio CoreML.
 ///
@@ -20,15 +23,10 @@ final class Qwen3AsrEngine: TranscribingEngine {
     var language: String?
 
     private var asrManager: Qwen3AsrManager?
-    private var loadingTask: Task<Void, Never>?
+    private let modelLoad = SingleFlight()
 
     func loadModel() async {
-        if let existing = loadingTask {
-            await existing.value
-            return
-        }
-
-        let task = Task {
+        await modelLoad.run { [self] in
             modelState = .downloading
             downloadProgress = 0
             do {
@@ -44,25 +42,22 @@ final class Qwen3AsrEngine: TranscribingEngine {
                 asrManager = manager
                 modelState = .loaded
             } catch {
-                NSLog("Qwen3-ASR model load failed: \(error)")
+                logger.error("Qwen3-ASR model load failed: \(error.localizedDescription, privacy: .public)")
                 modelState = .unloaded
                 downloadProgress = 0
             }
-            loadingTask = nil
         }
-        loadingTask = task
-        await task.value
     }
 
     private func ensureModel() async throws {
         if asrManager != nil { return }
-        NSLog("Qwen3-ASR: model not loaded, loading...")
+        logger.info("Qwen3-ASR: model not loaded, loading...")
         await loadModel()
         guard asrManager != nil else {
-            NSLog("Qwen3-ASR: model load FAILED, state=\(modelState)")
+            logger.error("Qwen3-ASR: model load FAILED, state=\(String(describing: self.modelState), privacy: .public)")
             throw TranscriptionError.modelNotLoaded
         }
-        NSLog("Qwen3-ASR: model loaded successfully")
+        logger.info("Qwen3-ASR: model loaded successfully")
     }
 
     func transcribeSegments(audioPath: URL) async throws -> [TimestampedSegment] {
@@ -95,14 +90,15 @@ final class Qwen3AsrEngine: TranscribingEngine {
 
         // Chunk audio into <=30s segments (Qwen3AsrConfig.maxAudioSeconds)
         let maxSamples = Int(Qwen3AsrConfig.maxAudioSeconds * 16000)
+        let chunkRanges = Qwen3AsrChunking.chunkRanges(
+            totalCount: resampled.count,
+            maxSamples: maxSamples,
+        )
+        let totalChunks = max(1, chunkRanges.count)
         var allText: [String] = []
-        var offset = 0
-        let totalChunks = max(1, (resampled.count + maxSamples - 1) / maxSamples)
-        var chunkIndex = 0
 
-        while offset < resampled.count {
-            let end = min(offset + maxSamples, resampled.count)
-            let chunk = Array(resampled[offset ..< end])
+        for (chunkIndex, range) in chunkRanges.enumerated() {
+            let chunk = Array(resampled[range])
             let chunkText = try await manager.transcribe(
                 audioSamples: chunk,
                 language: resolvedLanguage,
@@ -111,9 +107,7 @@ final class Qwen3AsrEngine: TranscribingEngine {
             if !trimmed.isEmpty {
                 allText.append(trimmed)
             }
-            chunkIndex += 1
-            transcriptionProgress = Double(chunkIndex) / Double(totalChunks)
-            offset = end
+            transcriptionProgress = Double(chunkIndex + 1) / Double(totalChunks)
         }
         transcriptionProgress = 1.0
 

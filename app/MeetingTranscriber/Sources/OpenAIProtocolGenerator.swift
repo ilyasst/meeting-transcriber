@@ -10,6 +10,7 @@ struct OpenAIProtocolGenerator: ProtocolGenerating {
     let apiKey: String?
     let language: String
     let timeoutSeconds: TimeInterval
+    let session: URLSession
 
     init(
         endpoint: URL,
@@ -17,19 +18,18 @@ struct OpenAIProtocolGenerator: ProtocolGenerating {
         language: String,
         apiKey: String? = nil,
         timeoutSeconds: TimeInterval = 600,
+        session: URLSession = .shared,
     ) {
         self.endpoint = endpoint
         self.model = model
         self.language = language
         self.apiKey = apiKey
         self.timeoutSeconds = timeoutSeconds
+        self.session = session
     }
 
     func generate(transcript: String, title _: String, diarized: Bool) async throws -> String {
-        var systemPrompt = ProtocolGenerator.applyLanguage(ProtocolGenerator.loadPrompt(), language: language)
-        if diarized {
-            systemPrompt += ProtocolGenerator.diarizationNote
-        }
+        let systemPrompt = ProtocolGenerator.buildSystemPrompt(diarized: diarized, language: language)
 
         let messages: [[String: Any]] = [
             ["role": "system", "content": systemPrompt],
@@ -44,7 +44,10 @@ struct OpenAIProtocolGenerator: ProtocolGenerating {
 
         let bodyData = try JSONSerialization.data(withJSONObject: body)
 
-        var request = URLRequest(url: endpoint)
+        let requestURL = Self.apiBaseURL(from: endpoint)
+            .appendingPathComponent("chat")
+            .appendingPathComponent("completions")
+        var request = URLRequest(url: requestURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let apiKey, !apiKey.isEmpty {
@@ -57,12 +60,16 @@ struct OpenAIProtocolGenerator: ProtocolGenerating {
 
         let (bytes, response): (URLSession.AsyncBytes, URLResponse)
         do {
-            (bytes, response) = try await URLSession.shared.bytes(for: request)
+            (bytes, response) = try await session.bytes(for: request)
         } catch {
+            logger.error(
+                "openai_connection_failed endpoint=\(requestURL.absoluteString, privacy: .public) model=\(self.model, privacy: .public) error=\(error.localizedDescription, privacy: .public)",
+            )
             throw ProtocolError.connectionFailed(error.localizedDescription)
         }
 
         guard let httpResponse = response as? HTTPURLResponse else {
+            logger.error("openai_invalid_response endpoint=\(requestURL.absoluteString, privacy: .public)")
             throw ProtocolError.connectionFailed("Invalid response")
         }
 
@@ -73,6 +80,9 @@ struct OpenAIProtocolGenerator: ProtocolGenerating {
                 errorBody += line
                 if errorBody.count > 500 { break }
             }
+            logger.error(
+                "openai_http_error status=\(httpResponse.statusCode, privacy: .public) endpoint=\(requestURL.absoluteString, privacy: .public) body=\(errorBody, privacy: .public)",
+            )
             throw ProtocolError.httpError(httpResponse.statusCode, errorBody)
         }
 
@@ -112,17 +122,34 @@ struct OpenAIProtocolGenerator: ProtocolGenerating {
         return content
     }
 
+    /// Normalize a user-entered endpoint to the OpenAI API *base* URL (e.g.
+    /// `http://host/v1`), from which the concrete `/chat/completions` and
+    /// `/models` paths are derived.
+    ///
+    /// Accepts both conventions so no existing configuration breaks:
+    ///   - base URL:          `http://host/v1`                  → `http://host/v1`
+    ///   - full endpoint URL: `http://host/v1/chat/completions` → `http://host/v1`
+    ///
+    /// The OpenAI ecosystem (and LM Studio's own UI) presents the base URL,
+    /// while this app historically shipped the full chat-completions URL as its
+    /// default — collapsing both to the same base means either works.
+    static func apiBaseURL(from endpoint: URL) -> URL {
+        guard endpoint.lastPathComponent == "completions" else { return endpoint }
+        let chat = endpoint.deletingLastPathComponent()
+        guard chat.lastPathComponent == "chat" else { return endpoint }
+        return chat.deletingLastPathComponent()
+    }
+
     /// Test connection to the API by querying available models.
     /// Returns model names on success.
-    static func testConnection(endpoint: String, model _: String, apiKey: String?) async -> Result<[String], Error> {
-        // Derive models endpoint from chat completions endpoint
-        guard let chatURL = URL(string: endpoint) else {
+    static func testConnection(endpoint: String, model _: String, apiKey: String?, session: URLSession = .shared) async -> Result<[String], any Error> {
+        // Accept either the API base URL (.../v1) or the full chat-completions
+        // URL (.../v1/chat/completions); both resolve to the same base + /models.
+        guard let entered = URL(string: endpoint) else {
             return .failure(ProtocolError.connectionFailed("Invalid endpoint URL"))
         }
 
-        // Navigate from .../v1/chat/completions to .../v1/models
-        let baseURL = chatURL.deletingLastPathComponent().deletingLastPathComponent()
-        let modelsURL = baseURL.appendingPathComponent("models")
+        let modelsURL = apiBaseURL(from: entered).appendingPathComponent("models")
 
         var request = URLRequest(url: modelsURL)
         request.httpMethod = "GET"
@@ -132,7 +159,7 @@ struct OpenAIProtocolGenerator: ProtocolGenerating {
         }
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse,
                   (200 ... 299).contains(httpResponse.statusCode)
             else {

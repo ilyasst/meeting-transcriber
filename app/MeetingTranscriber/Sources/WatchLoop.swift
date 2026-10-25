@@ -4,7 +4,7 @@ import os.log
 private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "WatchLoop")
 
 /// Info about a manually started recording session.
-struct ManualRecordingInfo {
+struct ManualRecordingInfo: Equatable {
     let pid: pid_t
     let appName: String
     let title: String
@@ -30,7 +30,11 @@ class WatchLoop {
 
     // Manual recording
     private(set) var manualRecordingInfo: ManualRecordingInfo?
-    private var activeRecorder: RecordingProvider?
+    /// Exposed for read-only access — AppState's per-channel level monitor polls
+    /// `appLevelDBFS` / `micLevelDBFS` here at ~10 Hz to drive the asymmetric-silence
+    /// indicator. Setter stays private so the recording lifecycle flows through
+    /// this class only.
+    private(set) var activeRecorder: (any RecordingProvider)?
     private var manualRecordingTask: Task<Void, Never>?
 
     var isManualRecording: Bool {
@@ -38,9 +42,10 @@ class WatchLoop {
     }
 
     // Dependencies
-    let detector: MeetingDetecting
-    let recorderFactory: @MainActor () -> RecordingProvider
+    let detector: any MeetingDetecting
+    let recorderFactory: @MainActor () async -> any RecordingProvider
     var pipelineQueue: PipelineQueue?
+    var permissionChecker: () async -> HealthCheckResult = { await PermissionHealthCheck.runLive() }
 
     // Settings
     let pollInterval: TimeInterval
@@ -48,6 +53,35 @@ class WatchLoop {
     let maxDuration: TimeInterval
     let noMic: Bool
     let micDeviceUID: String?
+    /// Dynamic accessor — read at recording-start time so toggling the setting
+    /// at runtime takes effect on the next recording without an app restart.
+    let verboseDiagnostics: () -> Bool
+    /// Dynamic accessor — when true, skip the post-processing pipeline and
+    /// instead write a `<basename>_meta.json` sidecar next to the recording.
+    let recordOnly: () -> Bool
+    /// Dynamic accessor — destination for record-only output (WAVs + sidecar
+    /// JSON). Returns a `(scope, writeDir)` pair so we can call
+    /// `startAccessingSecurityScopedResource()` on the *bookmark-resolved
+    /// parent* (the URL the user actually picked) while writing into a
+    /// `recordings/` subfolder. Calling start-access on a child URL silently
+    /// fails inside the App Store sandbox — see `RecordOnlyDestination`.
+    let recordOnlyDestination: () -> RecordOnlyDestination
+    /// Surface user-facing failures (e.g. sidecar write errors) that don't
+    /// transition state to `.error`. Defaults to a silent no-op for tests.
+    let notifier: any AppNotifying
+
+    /// Wall-clock source. Defaults to `Date()`; tests inject a `TestClock`
+    /// so timing-sensitive paths become deterministic instead of racing
+    /// against `Task.sleep`'s actual jitter on loaded CI runners.
+    let nowProvider: () -> Date
+    /// Sleep primitive. Defaults to `Task.sleep`; tests inject the
+    /// matching `TestClock.sleep` so virtual time advances synchronously.
+    let sleepProvider: (TimeInterval) async throws -> Void
+    /// Process-alive probe. Defaults to `kill(pid, 0) == 0`; tests inject
+    /// a closure with a deterministic answer so the
+    /// `monitorManualRecording` switch arms can be exercised without
+    /// spawning a real subprocess.
+    let pidAliveCheck: (pid_t) -> Bool
 
     private var watchTask: Task<Void, Never>?
 
@@ -55,14 +89,25 @@ class WatchLoop {
     var onStateChange: ((State, State) -> Void)?
 
     init(
-        detector: MeetingDetecting = WatchLoop.defaultDetector(),
-        recorderFactory: @MainActor @escaping () -> RecordingProvider = { DualSourceRecorder() },
+        detector: any MeetingDetecting = WatchLoop.defaultDetector(),
+        recorderFactory: @MainActor @escaping () async -> any RecordingProvider = { DualSourceRecorder() },
         pipelineQueue: PipelineQueue? = nil,
         pollInterval: TimeInterval = 3.0,
         endGracePeriod: TimeInterval = 15.0,
         maxDuration: TimeInterval = 14400,
         noMic: Bool = false,
         micDeviceUID: String? = nil,
+        verboseDiagnostics: @escaping () -> Bool = { false },
+        recordOnly: @escaping () -> Bool = { false },
+        recordOnlyDestination: @escaping () -> RecordOnlyDestination = {
+            .unscoped(AppPaths.recordingsDir)
+        },
+        notifier: any AppNotifying = SilentNotifier(),
+        nowProvider: @escaping () -> Date = Date.init,
+        sleepProvider: @escaping (TimeInterval) async throws -> Void = { interval in
+            try await Task.sleep(for: .seconds(interval))
+        },
+        pidAliveCheck: @escaping (pid_t) -> Bool = { kill($0, 0) == 0 },
     ) {
         self.detector = detector
         self.recorderFactory = recorderFactory
@@ -72,13 +117,20 @@ class WatchLoop {
         self.maxDuration = maxDuration
         self.noMic = noMic
         self.micDeviceUID = micDeviceUID
+        self.verboseDiagnostics = verboseDiagnostics
+        self.recordOnly = recordOnly
+        self.recordOnlyDestination = recordOnlyDestination
+        self.notifier = notifier
+        self.nowProvider = nowProvider
+        self.sleepProvider = sleepProvider
+        self.pidAliveCheck = pidAliveCheck
     }
 
     nonisolated static var defaultOutputDir: URL {
         AppPaths.downloadsProtocolsDir
     }
 
-    nonisolated static func defaultDetector() -> MeetingDetecting {
+    nonisolated static func defaultDetector() -> any MeetingDetecting {
         PowerAssertionDetector()
     }
 
@@ -86,13 +138,28 @@ class WatchLoop {
         state != .idle
     }
 
+    /// Value-type view of the five observable fields. Useful for tests,
+    /// `AppState+RPC` snapshots, and as the input/output shape for the
+    /// upcoming pure-function reducer slice.
+    var snapshot: WatchLoopState {
+        WatchLoopState(
+            phase: state,
+            currentMeeting: currentMeeting,
+            lastError: lastError,
+            detail: detail,
+            manualRecordingInfo: manualRecordingInfo,
+        )
+    }
+
     // MARK: - Start / Stop
 
     func start() {
         guard watchTask == nil else { return }
 
-        transition(to: .watching)
-        detail = "Polling for meetings..."
+        update { next in
+            next.phase = .watching
+            next.detail = "Polling for meetings..."
+        }
         logger.info("Watch mode started (poll: \(self.pollInterval)s, grace: \(self.endGracePeriod)s)")
 
         watchTask = Task { [weak self] in
@@ -104,39 +171,51 @@ class WatchLoop {
     func stop() {
         watchTask?.cancel()
         watchTask = nil
-        currentMeeting = nil
         cleanupManualRecording()
-        transition(to: .idle)
-        detail = ""
+        update { next in
+            next.phase = .idle
+            next.currentMeeting = nil
+            next.detail = ""
+        }
         logger.info("Watch mode stopped")
     }
 
     // MARK: - Manual Recording
 
-    func startManualRecording(pid: pid_t, appName: String, title: String) throws {
+    func startManualRecording(pid: pid_t, appName: String, title: String) async throws {
         guard state != .recording else {
             logger.warning("Cannot start manual recording — already recording")
             return
+        }
+
+        let health = await permissionChecker()
+        if !health.isHealthy {
+            throw RecorderError.permissionDenied(health.notificationBody)
         }
 
         // Stop auto-watch if active
         watchTask?.cancel()
         watchTask = nil
 
-        let recorder = recorderFactory()
-        try recorder.start(appPID: pid, noMic: noMic, micDeviceUID: micDeviceUID)
+        let recorder = await recorderFactory()
+        try recorder.start(
+            appPID: pid, noMic: noMic, micDeviceUID: micDeviceUID,
+            debugLogging: verboseDiagnostics(),
+        )
 
         activeRecorder = recorder
-        manualRecordingInfo = ManualRecordingInfo(pid: pid, appName: appName, title: title)
-        transition(to: .recording)
-        detail = "Recording: \(title)"
+        update { next in
+            next.phase = .recording
+            next.manualRecordingInfo = ManualRecordingInfo(pid: pid, appName: appName, title: title)
+            next.detail = "Recording: \(title)"
+        }
 
         manualRecordingTask = Task { [weak self] in
             guard let self else { return }
             await self.monitorManualRecording(pid: pid)
         }
 
-        logger.info("Manual recording started for \(appName) (PID \(pid)): \(title)")
+        logger.info("Manual recording started for \(appName) (PID \(pid)): \(title, privacy: .private)")
     }
 
     func stopManualRecording() {
@@ -145,38 +224,47 @@ class WatchLoop {
         manualRecordingTask?.cancel()
         manualRecordingTask = nil
 
+        var failureMessage: String?
         do {
             let recording = try recorder.stop()
             enqueueRecording(title: info.title, appName: info.appName, recording: recording)
         } catch {
             logger.error("Failed to stop manual recording: \(error)")
-            lastError = error.localizedDescription
+            failureMessage = error.localizedDescription
         }
 
         activeRecorder = nil
-        manualRecordingInfo = nil
-        transition(to: .idle)
-        detail = ""
+        update { next in
+            next.phase = .idle
+            next.manualRecordingInfo = nil
+            next.detail = ""
+            if let failureMessage { next.lastError = failureMessage }
+        }
     }
 
     private func monitorManualRecording(pid: pid_t) async {
-        let startTime = Date()
+        let startTime = nowProvider()
         while !Task.isCancelled {
-            // Check if process is still alive
-            if kill(pid, 0) != 0 {
+            let decision = ManualRecordingMonitorPolicy.step(
+                pidAlive: pidAliveCheck(pid),
+                elapsed: nowProvider().timeIntervalSince(startTime),
+                maxDuration: maxDuration,
+            )
+            switch decision {
+            case .continuePolling:
+                break
+
+            case .stopPidExited:
                 logger.info("Monitored app (PID \(pid)) exited — stopping manual recording")
                 stopManualRecording()
                 return
-            }
 
-            // Enforce max duration
-            if Date().timeIntervalSince(startTime) > maxDuration {
+            case .stopMaxDurationExceeded:
                 logger.info("Max recording duration reached — stopping manual recording")
                 stopManualRecording()
                 return
             }
-
-            try? await Task.sleep(for: .seconds(pollInterval))
+            try? await sleepProvider(pollInterval)
         }
     }
 
@@ -184,7 +272,7 @@ class WatchLoop {
         manualRecordingTask?.cancel()
         manualRecordingTask = nil
         activeRecorder = nil
-        manualRecordingInfo = nil
+        update { next in next.manualRecordingInfo = nil }
     }
 
     // MARK: - Watch Loop
@@ -198,40 +286,49 @@ class WatchLoop {
                     if error is CancellationError { return }
                     let msg = "Recording error: \(error)"
                     logger.error("\(msg)")
-                    lastError = error.localizedDescription
-                    transition(to: .error)
-                    detail = "Recording error: \(error.localizedDescription)"
-                    try? await Task.sleep(for: .seconds(10))
+                    update { next in
+                        next.phase = .error
+                        next.lastError = error.localizedDescription
+                        next.detail = "Recording error: \(error.localizedDescription)"
+                    }
+                    try? await sleepProvider(10)
                 }
 
                 detector.reset(appName: meeting.pattern.appName)
 
                 if !Task.isCancelled {
-                    transition(to: .watching)
-                    detail = "Polling for meetings..."
+                    update { next in
+                        next.phase = .watching
+                        next.detail = "Polling for meetings..."
+                    }
                 }
             }
 
-            try? await Task.sleep(for: .seconds(pollInterval))
+            try? await sleepProvider(pollInterval)
         }
     }
 
     // MARK: - Meeting Handling
 
     func handleMeeting(_ meeting: DetectedMeeting) async throws {
-        currentMeeting = meeting
         let title = Self.cleanTitle(meeting.windowTitle)
 
         // --- Recording ---
-        transition(to: .recording)
-        detail = "Recording: \(title)"
+        update { next in
+            next.phase = .recording
+            next.currentMeeting = meeting
+            next.detail = "Recording: \(title)"
+        }
 
-        let recorder = recorderFactory()
+        let recorder = await recorderFactory()
         try recorder.start(
             appPID: meeting.windowPID,
             noMic: noMic,
             micDeviceUID: micDeviceUID,
+            debugLogging: verboseDiagnostics(),
         )
+        activeRecorder = recorder
+        defer { activeRecorder = nil }
 
         // Read participants (Teams)
         var participants: [String] = []
@@ -242,8 +339,20 @@ class WatchLoop {
             participants = names
         }
 
-        // Wait for meeting to end
-        try await waitForMeetingEnd(meeting)
+        // Wait for meeting to end. If the watch task is cancelled mid-recording
+        // — the user clicked Stop Watching, or started a manual recording, both
+        // of which call `stop()` → `watchTask.cancel()` — treat it like a
+        // natural meeting end: fall through and finalize the recording rather
+        // than letting `CancellationError` discard it. The original bug lost
+        // the entire recording here (no WAV finalization, no PipelineJob, no
+        // naming dialog) because the cancellation propagated past `stop()` and
+        // `enqueueRecording()`. `recorder.stop()` + `enqueueRecording()` below
+        // are synchronous, so they still run to completion on the cancelled task.
+        do {
+            try await waitForMeetingEnd(meeting)
+        } catch is CancellationError {
+            logger.info("Watch cancelled mid-recording — finalizing in-flight recording")
+        }
 
         // Stop recording
         let recording = try recorder.stop()
@@ -261,30 +370,32 @@ class WatchLoop {
 
     func waitForMeetingEnd(_ meeting: DetectedMeeting) async throws {
         var graceStart: Date?
-        let startTime = Date()
+        let startTime = nowProvider()
+        let config = WatchLoopEndConfig(
+            maxDuration: maxDuration,
+            endGracePeriod: endGracePeriod,
+        )
 
         while !Task.isCancelled {
-            // Enforce max duration
-            if Date().timeIntervalSince(startTime) > maxDuration {
+            let decision = WatchLoopEndPolicy.step(
+                config: config,
+                now: nowProvider(),
+                startTime: startTime,
+                graceStart: graceStart,
+                meetingActive: detector.isMeetingActive(meeting),
+            )
+            switch decision {
+            case .stopMaxDurationExceeded:
                 logger.info("Max recording duration reached (\(Int(self.maxDuration))s)")
                 return
+
+            case .stopGraceExpired:
+                return
+
+            case let .continuePolling(newGraceStart):
+                graceStart = newGraceStart
             }
-
-            let active = detector.isMeetingActive(meeting)
-
-            if active {
-                if graceStart != nil {
-                    graceStart = nil
-                }
-            } else {
-                if graceStart == nil {
-                    graceStart = Date()
-                } else if let start = graceStart, Date().timeIntervalSince(start) >= endGracePeriod {
-                    return
-                }
-            }
-
-            try await Task.sleep(for: .seconds(pollInterval))
+            try await sleepProvider(pollInterval)
         }
     }
 
@@ -296,6 +407,16 @@ class WatchLoop {
         recording: RecordingResult,
         participants: [String] = [],
     ) {
+        if recordOnly() {
+            writeRecordOnlySidecar(
+                title: title,
+                appName: appName,
+                recording: recording,
+                participants: participants,
+            )
+            return
+        }
+
         let job = PipelineJob(
             meetingTitle: title,
             appName: appName,
@@ -306,14 +427,110 @@ class WatchLoop {
             participants: participants,
         )
         pipelineQueue?.enqueue(job)
-        logger.info("Enqueued pipeline job for: \(title)")
+        logger.info("Enqueued pipeline job for: \(title, privacy: .private)")
     }
 
-    private func transition(to newState: State) {
-        let old = state
-        state = newState
-        if old != newState {
-            onStateChange?(old, newState)
+    /// Convert a `ProcessInfo.systemUptime`-based timestamp captured at recording
+    /// start into a wall-clock `Date` by anchoring against "now" (also systemUptime).
+    private func wallClockDate(forUptime uptime: TimeInterval, now: Date = Date()) -> Date {
+        let elapsed = ProcessInfo.processInfo.systemUptime - uptime
+        return now.addingTimeInterval(-elapsed)
+    }
+
+    private func writeRecordOnlySidecar(
+        title: String,
+        appName: String,
+        recording: RecordingResult,
+        participants: [String],
+    ) {
+        let stoppedAt = Date()
+        let startedAt = wallClockDate(forUptime: recording.recordingStart, now: stoppedAt)
+
+        let mixName = recording.mixPath.lastPathComponent
+        let basename = RecordingFileSuffix.stripSuffix(from: mixName)?.stem
+            ?? recording.mixPath.deletingPathExtension().lastPathComponent
+
+        do {
+            let destination = recordOnlyDestination()
+            // start/stopAccessingSecurityScopedResource MUST be called on the
+            // URL that resolved from the bookmark (App Store sandboxed build,
+            // or any custom Output Folder pick) — calling it on a child path
+            // silently fails. We then write into the `recordings/` subfolder
+            // beneath that scope.
+            let accessing = destination.scope.startAccessingSecurityScopedResource()
+            defer { if accessing { destination.scope.stopAccessingSecurityScopedResource() } }
+
+            let destDir = destination.writeDir
+            try FileManager.default.createDirectory(
+                at: destDir, withIntermediateDirectories: true,
+            )
+            let movedMix = try Self.move(recording.mixPath, into: destDir)
+            let movedApp = try recording.appPath.map { try Self.move($0, into: destDir) }
+            let movedMic = try recording.micPath.map { try Self.move($0, into: destDir) }
+
+            let sidecar = RecordingSidecar(
+                title: title,
+                appName: appName,
+                startedAt: startedAt,
+                stoppedAt: stoppedAt,
+                participants: participants,
+                micDelaySeconds: recording.micDelay,
+                mixFilename: movedMix.lastPathComponent,
+                appFilename: movedApp?.lastPathComponent,
+                micFilename: movedMic?.lastPathComponent,
+            )
+            try sidecar.write(toDirectory: destDir, basename: basename)
+            logger.info("Record-only: wrote sidecar + WAVs to \(destDir.path) for \(title, privacy: .private)")
+        } catch {
+            logger.error("Record-only: \(error.localizedDescription)")
+            update { next in
+                next.lastError = "Record-only output failed: \(error.localizedDescription)"
+            }
+            // Record-only skips state transitions, so `lastError` alone is
+            // never surfaced. Notify directly so the user learns about the
+            // silent data-loss for downstream pipelines.
+            notifier.notify(
+                title: "Record-only output failed",
+                body: error.localizedDescription,
+            )
+        }
+    }
+
+    /// Move a file into `destDir`, returning its new URL. If a file with the
+    /// same name already exists at the destination it is overwritten.
+    private static func move(_ source: URL, into destDir: URL) throws -> URL {
+        let dest = destDir.appendingPathComponent(source.lastPathComponent)
+        try? FileManager.default.removeItem(at: dest)
+        try FileManager.default.moveItem(at: source, to: dest)
+        return dest
+    }
+
+    /// Single funnel through which every observable-field mutation flows.
+    /// Build the next snapshot, hand it to `apply` to commit only the
+    /// fields that actually changed, and let `apply` fire `onStateChange`
+    /// on a phase transition. Co-located mutations stay coherent
+    /// (a phase-change-plus-detail-update is one funnel call, not two
+    /// separate property writes that consumers could observe mid-flight).
+    private func update(_ transform: (inout WatchLoopState) -> Void) {
+        var next = snapshot
+        transform(&next)
+        apply(next)
+    }
+
+    /// Commit a new snapshot field-wise. Each `if old != new { old = new }`
+    /// guard avoids gratuitous `@Observable` invalidations for fields the
+    /// transform left alone; emit `onStateChange` if the phase moved.
+    private func apply(_ next: WatchLoopState) {
+        let oldPhase = state
+        if state != next.phase { state = next.phase }
+        if currentMeeting != next.currentMeeting { currentMeeting = next.currentMeeting }
+        if lastError != next.lastError { lastError = next.lastError }
+        if detail != next.detail { detail = next.detail }
+        if manualRecordingInfo != next.manualRecordingInfo {
+            manualRecordingInfo = next.manualRecordingInfo
+        }
+        if oldPhase != next.phase {
+            onStateChange?(oldPhase, next.phase)
         }
     }
 
@@ -334,5 +551,37 @@ class WatchLoop {
         case .recording: .recording
         case .error: .error
         }
+    }
+}
+
+/// Pair of URLs used by `WatchLoop` when persisting record-only output: the
+/// `scope` URL is what `startAccessingSecurityScopedResource()` is called on
+/// (the bookmark-resolved parent the user actually picked), and `writeDir` is
+/// the sub-path under that scope where the WAV + sidecar files land.
+///
+/// The split exists because Apple's security-scoped-bookmark API only grants
+/// access on the URL that resolved from the bookmark — calling start-access
+/// on a *child* path silently fails inside the App Store sandbox while
+/// appearing to work in the unsandboxed Homebrew build. The factory methods
+/// below make the two cases (real bookmark vs. transient app dir) explicit
+/// at every call site.
+struct RecordOnlyDestination: Equatable {
+    let scope: URL
+    let writeDir: URL
+
+    /// Production path: `parent` is the user-picked Output Folder (potentially
+    /// resolved from a security-scoped bookmark) and the WAVs land under
+    /// `parent/recordings/` so a Syncthing or rsync pair has a stable subtree.
+    static func production(parent: URL) -> Self {
+        Self(
+            scope: parent,
+            writeDir: parent.appendingPathComponent("recordings", isDirectory: true),
+        )
+    }
+
+    /// Test/default path: no security scope to manage — `scope == writeDir`,
+    /// so start-access is a harmless no-op and the writer hits `url` directly.
+    static func unscoped(_ url: URL) -> Self {
+        Self(scope: url, writeDir: url)
     }
 }

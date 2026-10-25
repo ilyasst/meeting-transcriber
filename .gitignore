@@ -11,7 +11,14 @@ tools/audiotap/.build/
 # Release build artifacts
 .build/
 
+# Git worktrees
+.worktrees/
+
 # Python
 __pycache__/
 *.pyc
 .coverage
+
+# Local-only plans (open findings, research dumps, deferred work, history).
+# docs/plans/ stays committed for future-feature RFCs and reference docs.
+docs/plans/.local/

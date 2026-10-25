@@ -1,8 +1,18 @@
 import Foundation
+import os.log
 import UserNotifications
 
-/// Sends macOS notifications for meeting state transitions.
-final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, AppNotifying {
+private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "NotificationManager")
+
+/// Sends macOS notifications for meeting state transitions. Marked
+/// `@unchecked Sendable` because:
+/// - `UNUserNotificationCenter` is thread-safe per Apple's docs
+/// - `isSetUp` is written exactly once in `setUp()` (called from the
+///   `@main` scene) and read thereafter, so no real race
+/// `@MainActor` would be cleaner but conflicts with the
+/// `UNUserNotificationCenterDelegate` callbacks, which the framework
+/// invokes from arbitrary queues.
+final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, AppNotifying, @unchecked Sendable {
     static let shared = NotificationManager()
 
     private(set) var isSetUp = false
@@ -16,7 +26,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, App
         guard !isSetUp else { return }
         // UNUserNotificationCenter crashes without a proper app bundle
         guard Bundle.main.bundleIdentifier != nil else {
-            print("NotificationManager: skipping setup (no app bundle)")
+            logger.warning("Skipping setup — no app bundle")
             return
         }
         isSetUp = true
@@ -25,10 +35,10 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, App
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { granted, error in
             if let error {
-                print("Notification permission error: \(error)")
+                logger.error("Notification permission error: \(error.localizedDescription, privacy: .public)")
             }
             if !granted {
-                print("Notification permission denied")
+                logger.warning("Notification permission denied")
             }
         }
     }

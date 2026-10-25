@@ -5,15 +5,13 @@ import XCTest
 // MARK: - Tests
 
 @MainActor
-final class WatchLoopE2ETests: XCTestCase {
+final class WatchLoopE2ETests: XCTestCase { // swiftlint:disable:this balanced_xctest_lifecycle
     // swiftlint:disable:next implicitly_unwrapped_optional
     private var tmpDir: URL!
 
     override func setUp() async throws {
         try await super.setUp()
-        tmpDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("watchloop_e2e_\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        tmpDir = try makeTempDirectory(prefix: "watchloop_e2e")
 
         // Ensure recordingsDir exists (handleMeeting writes intermediate 16kHz files there)
         try FileManager.default.createDirectory(
@@ -22,21 +20,7 @@ final class WatchLoopE2ETests: XCTestCase {
         )
     }
 
-    override func tearDown() async throws {
-        if let tmpDir, FileManager.default.fileExists(atPath: tmpDir.path) {
-            try? FileManager.default.removeItem(at: tmpDir)
-        }
-        try await super.tearDown()
-    }
-
     // MARK: - Helpers
-
-    private func fixtureURL() -> URL {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // Tests/
-            .appendingPathComponent("Fixtures")
-            .appendingPathComponent("two_speakers_de.wav")
-    }
 
     /// Upsample the fixture to 48kHz to simulate DualSourceRecorder output, save to tmpDir.
     private func prepare48kHzFixture(name: String = "mix.wav") throws -> URL {
@@ -73,7 +57,7 @@ final class WatchLoopE2ETests: XCTestCase {
         diarization: MockDiarization = MockDiarization(),
         protocolGen: MockProtocolGen = MockProtocolGen(),
         diarizeEnabled: Bool = false,
-        micLabel: String = "Roman",
+        micLabel: String = "Speaker A",
     ) -> PipelineQueue {
         PipelineQueue(
             engine: engine ?? WhisperKitEngine(),
@@ -109,10 +93,7 @@ final class WatchLoopE2ETests: XCTestCase {
     // MARK: - 1. Full Pipeline: detect → record → enqueue → transcribe → protocol
 
     func testFullPipelineDetectRecordTranscribeProtocol() async throws {
-        try XCTSkipIf(
-            ProcessInfo.processInfo.environment["CI"] != nil,
-            "Skipping in CI: requires WhisperKit model download",
-        )
+        try skipIfCIWithoutE2EOptIn("requires WhisperKit model download")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -166,10 +147,7 @@ final class WatchLoopE2ETests: XCTestCase {
     // MARK: - 2. Dual Source Transcription Path
 
     func testDualSourceTranscriptionPath() async throws {
-        try XCTSkipIf(
-            ProcessInfo.processInfo.environment["CI"] != nil,
-            "Skipping in CI: requires WhisperKit model download",
-        )
+        try skipIfCIWithoutE2EOptIn("requires WhisperKit model download")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -196,7 +174,7 @@ final class WatchLoopE2ETests: XCTestCase {
             engine: engine,
             protocolGen: mockProtocol,
             diarizeEnabled: false,
-            micLabel: "Roman",
+            micLabel: "Speaker A",
         )
         let loop = makeLoop(recorder: recorder, pipelineQueue: queue)
 
@@ -215,9 +193,9 @@ final class WatchLoopE2ETests: XCTestCase {
         XCTAssertTrue(mockProtocol.generateCalled, "Protocol generator should have been called")
         XCTAssertEqual(queue.jobs[0].state, .done, "Job should be done after dual-source processing")
 
-        // Verify transcript contains speaker labels (Roman / Remote)
+        // Verify transcript contains speaker labels (Speaker A / Remote)
         if let transcript = mockProtocol.capturedTranscript {
-            let hasLabels = transcript.contains("Roman") || transcript.contains("Remote")
+            let hasLabels = transcript.contains("Speaker A") || transcript.contains("Remote")
             XCTAssertTrue(hasLabels, "Dual-source transcript should contain speaker labels, got: \(transcript.prefix(200))")
         }
     }
@@ -261,10 +239,7 @@ final class WatchLoopE2ETests: XCTestCase {
     // MARK: - 4. Diarization Skipped When Not Available
 
     func testDiarizationSkippedWhenNotAvailable() async throws {
-        try XCTSkipIf(
-            ProcessInfo.processInfo.environment["CI"] != nil,
-            "Skipping in CI: requires WhisperKit model download",
-        )
+        try skipIfCIWithoutE2EOptIn("requires WhisperKit model download")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -334,10 +309,7 @@ final class WatchLoopE2ETests: XCTestCase {
     // MARK: - 6. Resample Path Produces 16kHz for WhisperKit
 
     func testResamplePathProduces16kHzForWhisperKit() async throws {
-        try XCTSkipIf(
-            ProcessInfo.processInfo.environment["CI"] != nil,
-            "Skipping in CI: requires WhisperKit model download",
-        )
+        try skipIfCIWithoutE2EOptIn("requires WhisperKit model download")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -380,10 +352,7 @@ final class WatchLoopE2ETests: XCTestCase {
     // MARK: - 7. Full Pipeline With Real Diarization (slow)
 
     func testFullPipelineWithRealDiarization() async throws {
-        try XCTSkipIf(
-            ProcessInfo.processInfo.environment["CI"] != nil,
-            "Skipping in CI: requires WhisperKit model + FluidAudio diarization",
-        )
+        try skipIfCIWithoutE2EOptIn("requires WhisperKit model + FluidAudio diarization")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -414,7 +383,7 @@ final class WatchLoopE2ETests: XCTestCase {
             outputDir: tmpDir,
             logDir: tmpDir,
             diarizeEnabled: true,
-            micLabel: "Roman",
+            micLabel: "Speaker A",
             speakerMatcherFactory: { SpeakerMatcher(dbPath: testDB) },
         )
         // swiftlint:enable trailing_closure

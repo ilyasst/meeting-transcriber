@@ -8,16 +8,22 @@ let package = Package(
         .library(name: "AudioTapLib", targets: ["AudioTapLib"]),
     ],
     targets: [
+        // Objective-C shim that bridges NSExceptions (e.g. from
+        // installTapOnBus) into Swift-catchable NSErrors. See header.
+        .target(
+            name: "CExceptionCatcher",
+            path: "Sources/CExceptionCatcher"
+        ),
         .target(
             name: "AudioTapLib",
+            dependencies: ["CExceptionCatcher"],
             path: "Sources",
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            exclude: ["CExceptionCatcher"]
         ),
         .testTarget(
             name: "AudioTapLibTests",
-            dependencies: ["AudioTapLib"],
-            path: "Tests",
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            dependencies: ["AudioTapLib", "CExceptionCatcher"],
+            path: "Tests"
         ),
     ]
 )

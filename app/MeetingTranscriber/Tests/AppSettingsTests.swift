@@ -5,25 +5,38 @@ import XCTest
 final class AppSettingsTests: XCTestCase {
     // swiftlint:disable:next implicitly_unwrapped_optional
     private var settings: AppSettings!
+    // swiftlint:disable:next implicitly_unwrapped_optional
+    private var defaults: UserDefaults!
+    // swiftlint:disable:next implicitly_unwrapped_optional
+    private var testSuiteName: String!
 
+    /// Each test gets its own volatile `UserDefaults(suiteName:)` so
+    /// `swift test --parallel` doesn't race on the shared on-disk plist.
+    /// AppSettings receives the suite via constructor injection.
+    ///
+    /// Keychain state is per-user (not per-process), so we deliberately do
+    /// NOT touch any production keychain accounts here — `swift test
+    /// --parallel` spawns a fresh `xctest` process per test method, and an
+    /// unconditional delete in setUp would race with the write performed
+    /// by `testOpenAIAPIKeyViaKeychainHelper` running in a sibling process.
+    /// The one test that needs a clean keychain slot manages the slot
+    /// itself.
     override func setUp() {
         super.setUp()
-        let keys = [
-            "watchTeams", "watchZoom", "watchWebex",
-            "pollInterval", "endGrace", "noMic", "micDeviceUID", "micName",
-            "diarize", "numSpeakers", "whisperKitModel", "claudeBin",
-            "protocolProvider", "openAIEndpoint", "openAIModel",
-            "checkForUpdates", "includePreReleases",
-        ]
-        KeychainHelper.delete(key: "openAIAPIKey")
-        for key in keys {
-            UserDefaults.standard.removeObject(forKey: key)
+        testSuiteName = "AppSettingsTests-\(getpid())-\(UUID().uuidString)"
+        guard let suite = UserDefaults(suiteName: testSuiteName) else {
+            XCTFail("Could not create test UserDefaults suite")
+            return
         }
-        settings = AppSettings()
+        defaults = suite
+        settings = AppSettings(defaults: defaults)
     }
 
     override func tearDown() {
         settings = nil
+        defaults.removePersistentDomain(forName: testSuiteName)
+        defaults = nil
+        testSuiteName = nil
         super.tearDown()
     }
 
@@ -40,6 +53,19 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.micName, "Me")
         XCTAssertTrue(settings.diarize)
         XCTAssertEqual(settings.whisperKitModel, "openai_whisper-large-v3-v20240930_turbo")
+        XCTAssertTrue(settings.perChannelIndicatorEnabled)
+        XCTAssertEqual(settings.asymmetricSilenceWarningSeconds, 90.0)
+        XCTAssertFalse(settings.liveTranscriptionEnabled)
+        XCTAssertFalse(settings.liveCaptionsEnglishStreaming)
+    }
+
+    func test_liveCaptionsEnglishStreaming_defaultsToFalse() {
+        XCTAssertFalse(settings.liveCaptionsEnglishStreaming)
+    }
+
+    func test_liveCaptionsEnglishStreaming_persistsToUserDefaults() {
+        settings.liveCaptionsEnglishStreaming = true
+        XCTAssertTrue(defaults.bool(forKey: "liveCaptionsEnglishStreaming"))
     }
 
     // MARK: - Clamping
@@ -79,6 +105,21 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.numSpeakers, 0)
     }
 
+    func testAsymmetricSilenceWarningSecondsClampedToMinimum() {
+        settings.asymmetricSilenceWarningSeconds = 10
+        XCTAssertEqual(settings.asymmetricSilenceWarningSeconds, 30)
+    }
+
+    func testAsymmetricSilenceWarningSecondsClampedToMaximum() {
+        settings.asymmetricSilenceWarningSeconds = 600
+        XCTAssertEqual(settings.asymmetricSilenceWarningSeconds, 300)
+    }
+
+    func testAsymmetricSilenceWarningSecondsAcceptsValidValue() {
+        settings.asymmetricSilenceWarningSeconds = 120
+        XCTAssertEqual(settings.asymmetricSilenceWarningSeconds, 120)
+    }
+
     func testNumSpeakersClampedToMinimumZero() {
         settings.numSpeakers = 0
         XCTAssertEqual(settings.numSpeakers, 0)
@@ -93,12 +134,12 @@ final class AppSettingsTests: XCTestCase {
 
     func testPollIntervalSavedToDefaults() {
         settings.pollInterval = 7.0
-        XCTAssertEqual(UserDefaults.standard.double(forKey: "pollInterval"), 7.0)
+        XCTAssertEqual(defaults.double(forKey: "pollInterval"), 7.0)
     }
 
     func testClampedValueSavedToDefaults() {
         settings.pollInterval = 0.5
-        XCTAssertEqual(UserDefaults.standard.double(forKey: "pollInterval"), 1.0)
+        XCTAssertEqual(defaults.double(forKey: "pollInterval"), 1.0)
     }
 
     // MARK: - watchApps
@@ -128,7 +169,19 @@ final class AppSettingsTests: XCTestCase {
 
         func testClaudeBinSavedToDefaults() {
             settings.claudeBin = "claude-work"
-            XCTAssertEqual(UserDefaults.standard.string(forKey: "claudeBin"), "claude-work")
+            XCTAssertEqual(defaults.string(forKey: "claudeBin"), "claude-work")
+        }
+
+        func testDebugRPCEnabledDefault() {
+            XCTAssertFalse(settings.debugRPCEnabled)
+        }
+
+        func testDebugRPCEnabledPersistence() {
+            settings.debugRPCEnabled = true
+            XCTAssertTrue(defaults.bool(forKey: "debugRPCEnabled"))
+            // Verify a fresh instance reads it back from the same suite.
+            let fresh = AppSettings(defaults: defaults)
+            XCTAssertTrue(fresh.debugRPCEnabled)
         }
     #endif
 
@@ -136,12 +189,12 @@ final class AppSettingsTests: XCTestCase {
 
     func testWhisperKitModelSavedToDefaults() {
         settings.whisperKitModel = "openai_whisper-small"
-        XCTAssertEqual(UserDefaults.standard.string(forKey: "whisperKitModel"), "openai_whisper-small")
+        XCTAssertEqual(defaults.string(forKey: "whisperKitModel"), "openai_whisper-small")
     }
 
     func testMicNameSavedToDefaults() {
-        settings.micName = "Roman"
-        XCTAssertEqual(UserDefaults.standard.string(forKey: "micName"), "Roman")
+        settings.micName = "Speaker A"
+        XCTAssertEqual(defaults.string(forKey: "micName"), "Speaker A")
     }
 
     // MARK: - Protocol Provider
@@ -157,16 +210,16 @@ final class AppSettingsTests: XCTestCase {
     func testProtocolProviderPersistence() {
         settings.protocolProvider = .openAICompatible
         XCTAssertEqual(
-            UserDefaults.standard.string(forKey: "protocolProvider"),
+            defaults.string(forKey: "protocolProvider"),
             "openAICompatible",
         )
-        // Verify a fresh instance reads it back
-        let fresh = AppSettings()
+        // Verify a fresh instance reads it back from the same suite.
+        let fresh = AppSettings(defaults: defaults)
         XCTAssertEqual(fresh.protocolProvider, .openAICompatible)
     }
 
     func testOpenAIEndpointDefault() {
-        XCTAssertEqual(settings.openAIEndpoint, "http://localhost:11434/v1/chat/completions")
+        XCTAssertEqual(settings.openAIEndpoint, "http://localhost:11434/v1")
     }
 
     func testOpenAIModelDefault() {
@@ -174,6 +227,12 @@ final class AppSettingsTests: XCTestCase {
     }
 
     func testOpenAIAPIKeyViaKeychainHelper() {
+        // Reset the keychain slot before + after so a crashed prior run
+        // can't seed `"sk-test-key"` and a failure here doesn't leak it
+        // to the next invocation.
+        KeychainHelper.delete(key: "openAIAPIKey")
+        defer { KeychainHelper.delete(key: "openAIAPIKey") }
+
         XCTAssertEqual(settings.openAIAPIKey, "")
 
         settings.openAIAPIKey = "sk-test-key"
@@ -188,14 +247,14 @@ final class AppSettingsTests: XCTestCase {
     func testOpenAIEndpointSavedToDefaults() {
         settings.openAIEndpoint = "http://localhost:8080/v1/chat/completions"
         XCTAssertEqual(
-            UserDefaults.standard.string(forKey: "openAIEndpoint"),
+            defaults.string(forKey: "openAIEndpoint"),
             "http://localhost:8080/v1/chat/completions",
         )
     }
 
     func testOpenAIModelSavedToDefaults() {
         settings.openAIModel = "mistral"
-        XCTAssertEqual(UserDefaults.standard.string(forKey: "openAIModel"), "mistral")
+        XCTAssertEqual(defaults.string(forKey: "openAIModel"), "mistral")
     }
 
     // MARK: - Update Settings
@@ -210,12 +269,137 @@ final class AppSettingsTests: XCTestCase {
 
     func testCheckForUpdatesPersistence() {
         settings.checkForUpdates = false
-        XCTAssertFalse(UserDefaults.standard.bool(forKey: "checkForUpdates"))
+        XCTAssertFalse(defaults.bool(forKey: "checkForUpdates"))
     }
 
     func testIncludePreReleasesPersistence() {
         settings.includePreReleases = true
-        XCTAssertTrue(UserDefaults.standard.bool(forKey: "includePreReleases"))
+        XCTAssertTrue(defaults.bool(forKey: "includePreReleases"))
+    }
+
+    // MARK: - Record Only
+
+    func test_recordOnly_defaultsToFalse() {
+        XCTAssertFalse(settings.recordOnly)
+    }
+
+    func test_recordOnly_persistsToUserDefaults() {
+        settings.recordOnly = true
+        XCTAssertTrue(defaults.bool(forKey: "recordOnly"))
+    }
+
+    // MARK: - Verbose Diagnostics (legacy audioDebugLogging migration)
+
+    func test_verboseDiagnostics_defaultsToFalse() {
+        XCTAssertFalse(settings.verboseDiagnostics)
+    }
+
+    func test_verboseDiagnostics_persistsUnderNewKey() {
+        settings.verboseDiagnostics = true
+        XCTAssertTrue(defaults.bool(forKey: "verboseDiagnostics"))
+    }
+
+    func test_verboseDiagnostics_migratesFromLegacyAudioDebugLoggingKey() {
+        let suiteName = "AppSettingsTests-migration-\(UUID().uuidString)"
+        guard let suite = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Could not create suite")
+            return
+        }
+        defer { UserDefaults().removePersistentDomain(forName: suiteName) }
+
+        suite.set(true, forKey: "audioDebugLogging")
+
+        let migrated = AppSettings(defaults: suite)
+        XCTAssertTrue(migrated.verboseDiagnostics)
+        XCTAssertTrue(suite.bool(forKey: "verboseDiagnostics"))
+    }
+
+    func test_verboseDiagnostics_newKeyTakesPrecedenceOverLegacy() {
+        let suiteName = "AppSettingsTests-precedence-\(UUID().uuidString)"
+        guard let suite = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Could not create suite")
+            return
+        }
+        defer { UserDefaults().removePersistentDomain(forName: suiteName) }
+
+        suite.set(true, forKey: "audioDebugLogging")
+        suite.set(false, forKey: "verboseDiagnostics")
+
+        let migrated = AppSettings(defaults: suite)
+        XCTAssertFalse(migrated.verboseDiagnostics)
+    }
+
+    func test_verboseDiagnostics_migrationRemovesLegacyKey() {
+        let suiteName = "AppSettingsTests-cleanup-\(UUID().uuidString)"
+        guard let suite = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Could not create suite")
+            return
+        }
+        defer { UserDefaults().removePersistentDomain(forName: suiteName) }
+
+        suite.set(true, forKey: "audioDebugLogging")
+
+        _ = AppSettings(defaults: suite)
+
+        XCTAssertNil(
+            suite.object(forKey: "audioDebugLogging"),
+            "Legacy audioDebugLogging key should be removed once migrated to verboseDiagnostics",
+        )
+        XCTAssertTrue(suite.bool(forKey: "verboseDiagnostics"))
+    }
+
+    // MARK: - Diarizer Tuning (Experimental)
+
+    func testDiarizerTuningDefaults() {
+        XCTAssertEqual(settings.clusterThreshold, 0.6)
+        XCTAssertEqual(settings.warmStartFa, 0.07)
+        XCTAssertEqual(settings.warmStartFb, 0.8)
+        XCTAssertEqual(settings.minSegmentDurationSeconds, 1.0)
+        XCTAssertTrue(settings.excludeOverlap)
+        XCTAssertTrue(settings.diarizerTuningIsAllDefaults)
+    }
+
+    func testDiarizerTuningRoundTrip() {
+        settings.clusterThreshold = 0.42
+        settings.warmStartFa = 0.13
+        settings.warmStartFb = 1.25
+        settings.minSegmentDurationSeconds = 2.5
+        settings.excludeOverlap = false
+
+        // Persisted under the documented keys.
+        XCTAssertEqual(defaults.double(forKey: "diarizerClusterThreshold"), 0.42)
+        XCTAssertEqual(defaults.double(forKey: "diarizerWarmStartFa"), 0.13)
+        XCTAssertEqual(defaults.double(forKey: "diarizerWarmStartFb"), 1.25)
+        XCTAssertEqual(defaults.double(forKey: "diarizerMinSegmentDuration"), 2.5)
+        XCTAssertFalse(defaults.bool(forKey: "diarizerExcludeOverlap"))
+
+        // Fresh instance reads the same suite back.
+        let fresh = AppSettings(defaults: defaults)
+        XCTAssertEqual(fresh.clusterThreshold, 0.42)
+        XCTAssertEqual(fresh.warmStartFa, 0.13)
+        XCTAssertEqual(fresh.warmStartFb, 1.25)
+        XCTAssertEqual(fresh.minSegmentDurationSeconds, 2.5)
+        XCTAssertFalse(fresh.excludeOverlap)
+        XCTAssertFalse(fresh.diarizerTuningIsAllDefaults)
+    }
+
+    func testResetDiarizerTuningRestoresDefaults() {
+        settings.clusterThreshold = 0.42
+        settings.warmStartFa = 0.13
+        settings.warmStartFb = 1.25
+        settings.minSegmentDurationSeconds = 2.5
+        settings.excludeOverlap = false
+
+        XCTAssertFalse(settings.diarizerTuningIsAllDefaults)
+
+        settings.resetDiarizerTuning()
+
+        XCTAssertEqual(settings.clusterThreshold, 0.6)
+        XCTAssertEqual(settings.warmStartFa, 0.07)
+        XCTAssertEqual(settings.warmStartFb, 0.8)
+        XCTAssertEqual(settings.minSegmentDurationSeconds, 1.0)
+        XCTAssertTrue(settings.excludeOverlap)
+        XCTAssertTrue(settings.diarizerTuningIsAllDefaults)
     }
 
     // MARK: - Keychain
@@ -236,5 +420,31 @@ final class AppSettingsTests: XCTestCase {
         KeychainHelper.delete(key: "HF_TOKEN_TEST")
         XCTAssertFalse(KeychainHelper.exists(key: "HF_TOKEN_TEST"))
         XCTAssertNil(KeychainHelper.read(key: "HF_TOKEN_TEST"))
+    }
+
+    /// `DiarizerMode` is persisted via `PipelineSnapshot` (PipelineJob.usedDiarizerMode)
+    /// and via UserDefaults (AppSettings.diarizerMode). The JSON/UserDefaults
+    /// shape is keyed off the implicit rawValues `"offline"` / `"sortformer"`
+    /// — a future case rename without a stable rawValue would silently break
+    /// snapshot decode. This test pins the wire format so any rename forces
+    /// an explicit migration decision.
+    func testDiarizerModeRawValuesPinJSONShape() throws {
+        XCTAssertEqual(DiarizerMode.offline.rawValue, "offline")
+        XCTAssertEqual(DiarizerMode.sortformer.rawValue, "sortformer")
+
+        let json = try JSONEncoder().encode([DiarizerMode.offline, .sortformer])
+        XCTAssertEqual(String(bytes: json, encoding: .utf8), #"["offline","sortformer"]"#)
+
+        let roundTrip = try JSONDecoder().decode([DiarizerMode].self, from: json)
+        XCTAssertEqual(roundTrip, [.offline, .sortformer])
+    }
+
+    /// `DiarizerMode.speakerCap` is the single source of truth for the
+    /// max-speaker constraint shared by `SpeakersSettingsView` and
+    /// `SpeakerNamingView`. Lock the values so a FluidAudio bump that
+    /// changes Sortformer's cap will surface here first.
+    func testDiarizerModeSpeakerCap() {
+        XCTAssertEqual(DiarizerMode.sortformer.speakerCap, 4)
+        XCTAssertEqual(DiarizerMode.offline.speakerCap, 10)
     }
 }

@@ -10,8 +10,7 @@ final class Qwen3E2ETests: XCTestCase {
         guard #available(macOS 15, *) else {
             throw XCTSkip("Qwen3-ASR requires macOS 15+")
         }
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires Qwen3-ASR model download (~1.75 GB)")
+        try skipIfCIWithoutE2EOptIn("requires Qwen3-ASR model download (~1.75 GB)")
 
         let engine = Qwen3AsrEngine()
         await engine.loadModel()
@@ -24,8 +23,7 @@ final class Qwen3E2ETests: XCTestCase {
         guard #available(macOS 15, *) else {
             throw XCTSkip("Qwen3-ASR requires macOS 15+")
         }
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires Qwen3-ASR model download (~1.75 GB)")
+        try skipIfCIWithoutE2EOptIn("requires Qwen3-ASR model download (~1.75 GB)")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -39,7 +37,6 @@ final class Qwen3E2ETests: XCTestCase {
         XCTAssertEqual(engine.modelState, .loaded, "Model should be loaded")
 
         let resampled16k = try resampleFixtureToTemp(fixture)
-        defer { try? FileManager.default.removeItem(at: resampled16k.deletingLastPathComponent()) }
 
         let segments = try await engine.transcribeSegments(audioPath: resampled16k)
 
@@ -62,8 +59,7 @@ final class Qwen3E2ETests: XCTestCase {
         guard #available(macOS 15, *) else {
             throw XCTSkip("Qwen3-ASR requires macOS 15+")
         }
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires Qwen3-ASR model download (~1.75 GB)")
+        try skipIfCIWithoutE2EOptIn("requires Qwen3-ASR model download (~1.75 GB)")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -77,7 +73,6 @@ final class Qwen3E2ETests: XCTestCase {
         XCTAssertEqual(engine.modelState, .loaded, "Model should be loaded")
 
         let resampled16k = try resampleFixtureToTemp(fixture)
-        defer { try? FileManager.default.removeItem(at: resampled16k.deletingLastPathComponent()) }
 
         let segments = try await engine.transcribeSegments(audioPath: resampled16k)
         XCTAssertFalse(segments.isEmpty, "Should produce at least one segment")
@@ -92,8 +87,7 @@ final class Qwen3E2ETests: XCTestCase {
         guard #available(macOS 15, *) else {
             throw XCTSkip("Qwen3-ASR requires macOS 15+")
         }
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires Qwen3-ASR model download (~1.75 GB)")
+        try skipIfCIWithoutE2EOptIn("requires Qwen3-ASR model download (~1.75 GB)")
 
         let engine = Qwen3AsrEngine()
         await engine.loadModel()
@@ -105,8 +99,7 @@ final class Qwen3E2ETests: XCTestCase {
         guard #available(macOS 15, *) else {
             throw XCTSkip("Qwen3-ASR requires macOS 15+")
         }
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires Qwen3-ASR model download (~1.75 GB)")
+        try skipIfCIWithoutE2EOptIn("requires Qwen3-ASR model download (~1.75 GB)")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -120,7 +113,6 @@ final class Qwen3E2ETests: XCTestCase {
         XCTAssertEqual(engine.modelState, .loaded, "Model should be loaded")
 
         let resampled16k = try resampleFixtureToTemp(fixture)
-        defer { try? FileManager.default.removeItem(at: resampled16k.deletingLastPathComponent()) }
 
         _ = try await engine.transcribeSegments(audioPath: resampled16k)
         XCTAssertEqual(
@@ -149,19 +141,9 @@ final class Qwen3E2ETests: XCTestCase {
         )
     }
 
-    private func fixtureURL(_ name: String = "two_speakers_de.wav") -> URL {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // Tests/
-            .appendingPathComponent("Fixtures")
-            .appendingPathComponent(name)
-    }
-
     /// Resample the 48kHz fixture to a 16kHz temp WAV file for Qwen3.
     private func resampleFixtureToTemp(_ fixture: URL) throws -> URL {
-        let tmpDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("qwen3_e2e_\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-
+        let tmpDir = try makeTempDirectory(prefix: "qwen3_e2e")
         let resampled16k = tmpDir.appendingPathComponent("resampled_16k.wav")
 
         let samples = try AudioMixer.loadAudioFileAsFloat32(url: fixture)

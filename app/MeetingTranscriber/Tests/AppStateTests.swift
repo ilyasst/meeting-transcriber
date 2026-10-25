@@ -4,33 +4,46 @@ import XCTest
 
 @MainActor
 final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_length
-    // MARK: - Helpers
+    // swiftlint:disable:previous balanced_xctest_lifecycle
+    // swiftlint:disable:next implicitly_unwrapped_optional
+    private var testLogDir: URL!
 
-    /// Yields repeatedly until `condition()` is true or the timeout elapses.
-    /// Needed for tests that await toggleWatching()/startManualRecording() which
-    /// internally spawn a Task containing AVCaptureDevice.requestAccess — a real
-    /// async suspension point that requires more than one yield to resolve.
-    private func waitFor(
-        _ condition: @autoclosure () -> Bool,
-        timeout: Duration = .milliseconds(500),
-    ) async {
-        let deadline = ContinuousClock.now + timeout
-        while !condition(), ContinuousClock.now < deadline {
-            await Task.yield()
-        }
+    override func setUp() async throws {
+        try await super.setUp()
+        // Per-test isolated logDir for the PipelineQueue snapshot file.
+        // Without it, concurrent test methods (xctest spawns a subprocess
+        // per method under `--parallel`) race on the production
+        // `AppPaths.ipcDir/pipeline_queue.json`, leaking jobs across
+        // tests as `count == 2` where `count == 1` is expected.
+        testLogDir = try makeTempDirectory(prefix: "AppStateTests")
     }
+
+    // MARK: - Helpers
 
     private func makeState() -> (AppState, RecordingNotifier) {
         let notifier = RecordingNotifier()
         let state = AppState(notifier: notifier)
+        // Inject a PipelineQueue with mocks + the per-test isolated logDir.
+        // The engine != nil arm short-circuits `pipeline.ensureQueue()` so
+        // it doesn't replace our queue with one wired to the production
+        // `AppPaths.ipcDir` path on the first `enqueueFiles` call.
+        state.pipeline.queue = PipelineQueue(
+            engine: MockEngine(),
+            diarizationFactory: { MockDiarization() },
+            protocolGeneratorFactory: { MockProtocolGen() },
+            outputDir: testLogDir,
+            logDir: testLogDir,
+        )
         return (state, notifier)
     }
 
-    /// AppState whose pipelineQueue writes to a temp dir (no real filesystem side effects).
+    /// AppState with a caller-provided logDir. Use when a test wants to
+    /// inspect snapshot contents at a known path; otherwise prefer
+    /// `makeState()` which uses the per-test isolated `testLogDir`.
     private func makeIsolatedState(logDir: URL) -> (AppState, RecordingNotifier) {
         let notifier = RecordingNotifier()
         let state = AppState(notifier: notifier)
-        state.pipelineQueue = PipelineQueue(logDir: logDir)
+        state.pipeline.queue = PipelineQueue(logDir: logDir)
         return (state, notifier)
     }
 
@@ -72,7 +85,7 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
     func testIsWatchingTrueWhenLoopActiveNotManual() {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
+        state.watching.watchLoop = loop
         loop.start()
         defer { loop.stop() }
         XCTAssertTrue(state.isWatching)
@@ -81,16 +94,16 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
     func testIsWatchingFalseWhenLoopNotStarted() {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
+        state.watching.watchLoop = loop
         // loop not started → isActive == false
         XCTAssertFalse(state.isWatching)
     }
 
-    func testIsWatchingFalseWhenManualRecording() throws {
+    func testIsWatchingFalseWhenManualRecording() async throws {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
-        try loop.startManualRecording(pid: 1234, appName: "Chrome", title: "Meeting")
+        state.watching.watchLoop = loop
+        try await loop.startManualRecording(pid: 1234, appName: "Chrome", title: "Meeting")
         defer { loop.stop() }
         XCTAssertFalse(state.isWatching)
     }
@@ -100,17 +113,17 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
     func testCurrentStateLabelWatchingWhenLoopActive() {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
+        state.watching.watchLoop = loop
         loop.start()
         defer { loop.stop() }
         XCTAssertEqual(state.currentStateLabel, "Watching for Meetings...")
     }
 
-    func testCurrentStateLabelRecordingWhenManualRecording() throws {
+    func testCurrentStateLabelRecordingWhenManualRecording() async throws {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
-        try loop.startManualRecording(pid: 1234, appName: "Chrome", title: "Meeting")
+        state.watching.watchLoop = loop
+        try await loop.startManualRecording(pid: 1234, appName: "Chrome", title: "Meeting")
         defer { loop.stop() }
         XCTAssertEqual(state.currentStateLabel, "Recording")
     }
@@ -118,10 +131,10 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
     func testCurrentStateLabelIdleWhenLoopStopped() {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
+        state.watching.watchLoop = loop
         loop.start()
         loop.stop()
-        state.watchLoop = nil
+        state.watching.watchLoop = nil
         XCTAssertEqual(state.currentStateLabel, "Idle")
     }
 
@@ -130,14 +143,14 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
     func testCurrentStatusNilWhenLoopNotStarted() {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
+        state.watching.watchLoop = loop
         XCTAssertNil(state.currentStatus)
     }
 
     func testCurrentStatusNotNilWhenLoopActive() {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
+        state.watching.watchLoop = loop
         loop.start()
         defer { loop.stop() }
         XCTAssertNotNil(state.currentStatus)
@@ -146,7 +159,7 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
     func testCurrentStatusStateMatchesLoopTranscriberState() {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
+        state.watching.watchLoop = loop
         loop.start()
         defer { loop.stop() }
         XCTAssertEqual(state.currentStatus?.state, .watching)
@@ -155,7 +168,7 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
     func testCurrentStatusDetailMatchesLoopDetail() {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
+        state.watching.watchLoop = loop
         loop.start()
         defer { loop.stop() }
         XCTAssertEqual(state.currentStatus?.detail, "Polling for meetings...")
@@ -164,17 +177,17 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
     func testCurrentStatusMeetingNilWhenNoActiveMeeting() {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
+        state.watching.watchLoop = loop
         loop.start()
         defer { loop.stop() }
         XCTAssertNil(state.currentStatus?.meeting)
     }
 
-    func testCurrentStatusMeetingFromManualRecordingInfo() throws {
+    func testCurrentStatusMeetingFromManualRecordingInfo() async throws {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
-        try loop.startManualRecording(pid: 42, appName: "Chrome", title: "Standup")
+        state.watching.watchLoop = loop
+        try await loop.startManualRecording(pid: 42, appName: "Chrome", title: "Standup")
         defer { loop.stop() }
         let status = try XCTUnwrap(state.currentStatus)
         XCTAssertEqual(status.meeting?.app, "Chrome")
@@ -197,11 +210,11 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         XCTAssertEqual(state.currentBadge, .updateAvailable)
     }
 
-    func testCurrentBadgeRecordingWhenLoopRecording() throws {
+    func testCurrentBadgeRecordingWhenLoopRecording() async throws {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
-        try loop.startManualRecording(pid: 42, appName: "Chrome", title: "Meeting")
+        state.watching.watchLoop = loop
+        try await loop.startManualRecording(pid: 42, appName: "Chrome", title: "Meeting")
         defer { loop.stop() }
         XCTAssertEqual(state.currentBadge, .recording)
     }
@@ -212,26 +225,26 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
         loop.start()
-        state.watchLoop = loop
+        state.watching.watchLoop = loop
         XCTAssertTrue(state.isWatching)
 
-        state.toggleWatching()
+        state.watching.toggleWatching()
 
-        XCTAssertNil(state.watchLoop)
+        XCTAssertNil(state.watching.watchLoop)
         XCTAssertFalse(state.isWatching)
     }
 
-    func testToggleWatchingWhileManualRecordingIsNoOp() throws {
+    func testToggleWatchingWhileManualRecordingIsNoOp() async throws {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
-        try loop.startManualRecording(pid: 1234, appName: "Chrome", title: "Meeting")
+        state.watching.watchLoop = loop
+        try await loop.startManualRecording(pid: 1234, appName: "Chrome", title: "Meeting")
         defer { loop.stop() }
 
-        state.toggleWatching() // must be a no-op
+        state.watching.toggleWatching() // must be a no-op
 
-        XCTAssertNotNil(state.watchLoop)
-        XCTAssertEqual(state.watchLoop?.isManualRecording, true)
+        XCTAssertNotNil(state.watching.watchLoop)
+        XCTAssertEqual(state.watching.watchLoop?.isManualRecording, true)
     }
 
     // MARK: - toggleWatching: start path (async)
@@ -242,41 +255,41 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
 
     func testToggleWatchingCreatesWatchLoop() async {
         let (state, _) = makeState()
-        addTeardownBlock { state.watchLoop?.stop() }
+        addTeardownBlock { state.watching.watchLoop?.stop() }
 
-        state.toggleWatching()
-        await waitFor(state.watchLoop != nil)
+        state.watching.toggleWatching()
+        await waitFor(state.watching.watchLoop != nil)
 
-        XCTAssertNotNil(state.watchLoop)
+        XCTAssertNotNil(state.watching.watchLoop)
     }
 
     func testToggleWatchingMakesLoopActive() async {
         let (state, _) = makeState()
-        addTeardownBlock { state.watchLoop?.stop() }
+        addTeardownBlock { state.watching.watchLoop?.stop() }
 
-        state.toggleWatching()
-        await waitFor(state.watchLoop?.isActive == true)
+        state.watching.toggleWatching()
+        await waitFor(state.watching.watchLoop?.isActive == true)
 
-        XCTAssertEqual(state.watchLoop?.isActive, true)
+        XCTAssertEqual(state.watching.watchLoop?.isActive, true)
     }
 
     // MARK: - stopManualRecording
 
-    func testStopManualRecordingClearsWatchLoop() throws {
+    func testStopManualRecordingClearsWatchLoop() async throws {
         let (state, _) = makeState()
         let (loop, _) = makeTestWatchLoop()
-        state.watchLoop = loop
-        try loop.startManualRecording(pid: 42, appName: "Chrome", title: "Meeting")
+        state.watching.watchLoop = loop
+        try await loop.startManualRecording(pid: 42, appName: "Chrome", title: "Meeting")
 
-        state.stopManualRecording()
+        state.watching.stopManualRecording()
 
-        XCTAssertNil(state.watchLoop)
+        XCTAssertNil(state.watching.watchLoop)
     }
 
     func testStopManualRecordingWhenNoLoopIsNoOp() {
         let (state, _) = makeState()
-        state.stopManualRecording() // must not crash
-        XCTAssertNil(state.watchLoop)
+        state.watching.stopManualRecording() // must not crash
+        XCTAssertNil(state.watching.watchLoop)
     }
 
     // MARK: - enqueueFiles
@@ -285,89 +298,221 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         let (state, _) = makeState()
         let url = URL(fileURLWithPath: "/tmp/sprint-review.wav")
 
-        state.enqueueFiles([url])
+        state.pipeline.enqueueFiles([url])
 
-        XCTAssertEqual(state.pipelineQueue.jobs.count, 1)
+        XCTAssertEqual(state.pipeline.queue.jobs.count, 1)
     }
 
     func testEnqueueFilesMultipleURLs() {
         let (state, _) = makeState()
         let urls = (1 ... 3).map { URL(fileURLWithPath: "/tmp/meeting-\($0).wav") }
 
-        state.enqueueFiles(urls)
+        state.pipeline.enqueueFiles(urls)
 
-        XCTAssertEqual(state.pipelineQueue.jobs.count, 3)
+        XCTAssertEqual(state.pipeline.queue.jobs.count, 3)
     }
 
     func testEnqueueFilesTitleFromLastPathComponent() {
         let (state, _) = makeState()
         let url = URL(fileURLWithPath: "/tmp/sprint-review.wav")
 
-        state.enqueueFiles([url])
+        state.pipeline.enqueueFiles([url])
 
-        XCTAssertEqual(state.pipelineQueue.jobs[0].meetingTitle, "sprint-review")
+        XCTAssertEqual(state.pipeline.queue.jobs[0].meetingTitle, "sprint-review")
     }
 
     func testEnqueueFilesAppNameIsFile() {
         let (state, _) = makeState()
-        state.enqueueFiles([URL(fileURLWithPath: "/tmp/meeting.wav")])
-        XCTAssertEqual(state.pipelineQueue.jobs[0].appName, "File")
+        state.pipeline.enqueueFiles([URL(fileURLWithPath: "/tmp/meeting.wav")])
+        XCTAssertEqual(state.pipeline.queue.jobs[0].appName, "File")
     }
 
     func testEnqueueFilesEmptyArrayIsNoOp() {
         let (state, _) = makeState()
-        state.enqueueFiles([])
-        XCTAssertTrue(state.pipelineQueue.jobs.isEmpty)
+        state.pipeline.enqueueFiles([])
+        XCTAssertTrue(state.pipeline.queue.jobs.isEmpty)
     }
 
     func testEnqueueFilesCreatesJobsWithNilAudioPaths() {
         let (state, _) = makeState()
-        state.enqueueFiles([URL(fileURLWithPath: "/tmp/meeting.wav")])
-        XCTAssertNil(state.pipelineQueue.jobs[0].appPath)
-        XCTAssertNil(state.pipelineQueue.jobs[0].micPath)
+        state.pipeline.enqueueFiles([URL(fileURLWithPath: "/tmp/meeting.wav")])
+        XCTAssertNil(state.pipeline.queue.jobs[0].appPath)
+        XCTAssertNil(state.pipeline.queue.jobs[0].micPath)
     }
 
-    // MARK: - ensurePipelineQueue
-
-    func testEnsurePipelineQueueReplacesBareQueue() {
+    func testEnqueueFilesPairsTripletAsOneDualTrackJob() {
         let (state, _) = makeState()
-        XCTAssertNil(state.pipelineQueue.engine, "Precondition: fresh queue has no engine")
+        let urls = [
+            URL(fileURLWithPath: "/tmp/standup_app.wav"),
+            URL(fileURLWithPath: "/tmp/standup_mic.wav"),
+            URL(fileURLWithPath: "/tmp/standup_mix.wav"),
+        ]
 
-        state.ensurePipelineQueue()
+        state.pipeline.enqueueFiles(urls)
 
-        XCTAssertNotNil(state.pipelineQueue.engine)
+        XCTAssertEqual(state.pipeline.queue.jobs.count, 1)
+        let job = state.pipeline.queue.jobs[0]
+        XCTAssertEqual(job.mixPath?.lastPathComponent, "standup_mix.wav")
+        XCTAssertEqual(job.appPath?.lastPathComponent, "standup_app.wav")
+        XCTAssertEqual(job.micPath?.lastPathComponent, "standup_mic.wav")
     }
 
-    func testEnsurePipelineQueueIdempotent() {
+    func testEnqueueExistingFilesEmptyArrayReturnsZero() {
         let (state, _) = makeState()
-        state.ensurePipelineQueue()
-        let firstID = ObjectIdentifier(state.pipelineQueue)
-
-        state.ensurePipelineQueue()
-
-        XCTAssertEqual(ObjectIdentifier(state.pipelineQueue), firstID)
+        XCTAssertEqual(state.pipeline.enqueueExistingFiles([]), 0)
+        XCTAssertTrue(state.pipeline.queue.jobs.isEmpty)
     }
 
-    // MARK: - makePipelineQueue
-
-    func testMakePipelineQueueHasEngine() {
+    func testEnqueueExistingFilesAllMissingReturnsZeroAndDoesNotEnqueue() {
         let (state, _) = makeState()
-        XCTAssertNotNil(state.makePipelineQueue().engine)
+        let urls = [
+            URL(fileURLWithPath: "/tmp/never-exists-\(UUID().uuidString).wav"),
+            URL(fileURLWithPath: "/tmp/also-missing-\(UUID().uuidString).wav"),
+        ]
+        XCTAssertEqual(state.pipeline.enqueueExistingFiles(urls), 0)
+        XCTAssertTrue(state.pipeline.queue.jobs.isEmpty)
     }
 
-    func testMakePipelineQueueHasDiarizationFactory() {
+    func testEnqueueExistingFilesPartialExistenceForwardsOnlyExisting() throws {
         let (state, _) = makeState()
-        XCTAssertNotNil(state.makePipelineQueue().diarizationFactory)
+        let tmpDir = try makeTempDirectory(prefix: "enqueue-existing")
+        let existing = tmpDir.appendingPathComponent("present.wav")
+        let missing = tmpDir.appendingPathComponent("absent.wav")
+        try Data("RIFF".utf8).write(to: existing)
+
+        let count = state.pipeline.enqueueExistingFiles([existing, missing])
+
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(state.pipeline.queue.jobs.count, 1)
+        XCTAssertEqual(state.pipeline.queue.jobs[0].mixPath?.lastPathComponent, "present.wav")
     }
 
-    func testMakePipelineQueueHasProtocolGeneratorFactory() {
+    func testEnqueueFilesAppPlusMicWithoutMixHasNilMixPath() {
+        // No `_mix.wav` in selection — job carries nil mixPath; the pipeline
+        // mixes app+mic into the workdir cache on the fly, no persistent mix
+        // is written to recordings/.
         let (state, _) = makeState()
-        XCTAssertNotNil(state.makePipelineQueue().protocolGeneratorFactory)
+        let urls = [
+            URL(fileURLWithPath: "/tmp/20260311_143000_app.wav"),
+            URL(fileURLWithPath: "/tmp/20260311_143000_mic.wav"),
+        ]
+
+        state.pipeline.enqueueFiles(urls)
+
+        XCTAssertEqual(state.pipeline.queue.jobs.count, 1)
+        let job = state.pipeline.queue.jobs[0]
+        XCTAssertNil(job.mixPath, "paired without mix → nil mixPath")
+        XCTAssertEqual(job.appPath?.lastPathComponent, "20260311_143000_app.wav")
+        XCTAssertEqual(job.micPath?.lastPathComponent, "20260311_143000_mic.wav")
     }
 
-    func testMakePipelineQueueSetsOutputDir() {
+    func testEnqueueFilesLoneAppFallsBackToSingleton() {
         let (state, _) = makeState()
-        XCTAssertNotNil(state.makePipelineQueue().outputDir)
+        let urls = [URL(fileURLWithPath: "/tmp/orphan_app.wav")]
+
+        state.pipeline.enqueueFiles(urls)
+
+        XCTAssertEqual(state.pipeline.queue.jobs.count, 1)
+        let job = state.pipeline.queue.jobs[0]
+        XCTAssertEqual(job.mixPath?.lastPathComponent, "orphan_app.wav")
+        XCTAssertNil(job.appPath)
+        XCTAssertNil(job.micPath)
+    }
+
+    func testEnqueueFilesMixedPairAndSingleton() {
+        let (state, _) = makeState()
+        let urls = [
+            URL(fileURLWithPath: "/tmp/meeting_app.wav"),
+            URL(fileURLWithPath: "/tmp/meeting_mic.wav"),
+            URL(fileURLWithPath: "/tmp/meeting_mix.wav"),
+            URL(fileURLWithPath: "/tmp/podcast.mp3"),
+        ]
+
+        state.pipeline.enqueueFiles(urls)
+
+        XCTAssertEqual(state.pipeline.queue.jobs.count, 2)
+        let paired = state.pipeline.queue.jobs.first { $0.appPath != nil }
+        let single = state.pipeline.queue.jobs.first { $0.appPath == nil }
+        XCTAssertEqual(paired?.meetingTitle, "meeting")
+        XCTAssertEqual(single?.meetingTitle, "podcast")
+    }
+
+    func testEnqueueFilesUsesSidecarMetadataWhenPresent() throws {
+        let (state, _) = makeState()
+        let tmpDir = try makeTempDirectory(prefix: "enqueue-sidecar")
+        let basename = "20260311_143000"
+
+        try RecordingSidecar(
+            title: "Sprint Review",
+            appName: "Microsoft Teams",
+            startedAt: Date(timeIntervalSince1970: 1_777_000_000),
+            stoppedAt: Date(timeIntervalSince1970: 1_777_001_800),
+            participants: ["Speaker A", "Speaker B"],
+            micDelaySeconds: 0.25,
+            mixFilename: "\(basename)_mix.wav",
+            appFilename: "\(basename)_app.wav",
+            micFilename: "\(basename)_mic.wav",
+        ).write(toDirectory: tmpDir, basename: basename)
+
+        state.pipeline.enqueueFiles([
+            tmpDir.appendingPathComponent("\(basename)_app.wav"),
+            tmpDir.appendingPathComponent("\(basename)_mic.wav"),
+            tmpDir.appendingPathComponent("\(basename)_mix.wav"),
+        ])
+
+        XCTAssertEqual(state.pipeline.queue.jobs.count, 1)
+        let job = state.pipeline.queue.jobs[0]
+        XCTAssertEqual(job.meetingTitle, "Sprint Review")
+        XCTAssertEqual(job.appName, "Microsoft Teams")
+        XCTAssertEqual(job.participants, ["Speaker A", "Speaker B"])
+        XCTAssertEqual(job.micDelay, 0.25, accuracy: 0.0001)
+    }
+
+    // MARK: - pipeline.ensureQueue
+
+    func testEnsureQueueReplacesBareQueue() {
+        // Bare queue (no engine) — uses the no-engine init; logDir is the
+        // production path but this test never enqueues so no I/O hits it.
+        let notifier = RecordingNotifier()
+        let state = AppState(notifier: notifier)
+        state.pipeline.queue = PipelineQueue(logDir: testLogDir)
+        XCTAssertNil(state.pipeline.queue.engine, "Precondition: fresh queue has no engine")
+
+        state.pipeline.ensureQueue()
+
+        XCTAssertNotNil(state.pipeline.queue.engine)
+    }
+
+    func testEnsureQueueIdempotent() {
+        let (state, _) = makeState()
+        state.pipeline.ensureQueue()
+        let firstID = ObjectIdentifier(state.pipeline.queue)
+
+        state.pipeline.ensureQueue()
+
+        XCTAssertEqual(ObjectIdentifier(state.pipeline.queue), firstID)
+    }
+
+    // MARK: - pipeline.makeQueue
+
+    func testMakeQueueHasEngine() {
+        let (state, _) = makeState()
+        XCTAssertNotNil(state.pipeline.makeQueue().engine)
+    }
+
+    func testMakeQueueHasDiarizationFactory() {
+        let (state, _) = makeState()
+        XCTAssertNotNil(state.pipeline.makeQueue().diarizationFactory)
+    }
+
+    func testMakeQueueHasProtocolGeneratorFactory() {
+        let (state, _) = makeState()
+        XCTAssertNotNil(state.pipeline.makeQueue().protocolGeneratorFactory)
+    }
+
+    func testMakeQueueSetsOutputDir() {
+        let (state, _) = makeState()
+        XCTAssertNotNil(state.pipeline.makeQueue().outputDir)
     }
 
     // MARK: - makeProtocolGenerator
@@ -376,7 +521,7 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         let settings = AppSettings()
         settings.protocolProvider = .openAICompatible
         let state = AppState(settings: settings)
-        XCTAssertTrue(state.makeProtocolGenerator() is OpenAIProtocolGenerator)
+        XCTAssertTrue(state.pipeline.makeProtocolGenerator() is OpenAIProtocolGenerator)
     }
 
     #if !APPSTORE
@@ -384,38 +529,39 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
             let settings = AppSettings()
             settings.protocolProvider = .claudeCLI
             let state = AppState(settings: settings)
-            XCTAssertTrue(state.makeProtocolGenerator() is ClaudeCLIProtocolGenerator)
+            XCTAssertTrue(state.pipeline.makeProtocolGenerator() is ClaudeCLIProtocolGenerator)
         }
     #endif
 
-    // MARK: - configurePipelineCallbacks
+    func testMakeProtocolGeneratorReturnsNilForNoneProvider() {
+        let settings = AppSettings()
+        settings.protocolProvider = .none
+        let state = AppState(settings: settings)
+        XCTAssertNil(state.pipeline.makeProtocolGenerator())
+    }
 
-    func testConfigurePipelineCallbacksDoneFiresNotification() throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("appstate_callbacks_\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tmpDir) }
+    // MARK: - pipeline.configureCallbacks
+
+    func testConfigureCallbacksDoneFiresNotification() throws {
+        let tmpDir = try makeTempDirectory(prefix: "appstate_callbacks")
 
         let (state, notifier) = makeIsolatedState(logDir: tmpDir)
-        state.configurePipelineCallbacks()
+        state.pipeline.configureCallbacks()
 
         var job = makeJob(title: "Sprint Review")
         job.protocolPath = URL(fileURLWithPath: "/tmp/protocol.md")
-        state.pipelineQueue.onJobStateChange?(job, .transcribing, .done)
+        state.pipeline.queue.onJobStateChange?(job, .transcribing, .done)
 
         XCTAssertEqual(notifier.calls.count, 1)
         XCTAssertEqual(notifier.calls[0].title, "Protocol Ready")
         XCTAssertEqual(notifier.calls[0].body, "Sprint Review")
     }
 
-    func testConfigurePipelineCallbacksErrorFiresNotification() throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("appstate_callbacks_\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tmpDir) }
+    func testConfigureCallbacksErrorFiresNotification() throws {
+        let tmpDir = try makeTempDirectory(prefix: "appstate_callbacks")
 
         let (state, notifier) = makeIsolatedState(logDir: tmpDir)
-        state.configurePipelineCallbacks()
+        state.pipeline.configureCallbacks()
 
         var job = makeJob()
         job = PipelineJob(
@@ -428,23 +574,20 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         )
         // Simulate a job with an error string
         let errorJob = jobWithError(job, message: "Transcription failed")
-        state.pipelineQueue.onJobStateChange?(errorJob, .transcribing, .error)
+        state.pipeline.queue.onJobStateChange?(errorJob, .transcribing, .error)
 
         XCTAssertEqual(notifier.calls.count, 1)
         XCTAssertEqual(notifier.calls[0].title, "Error")
         XCTAssertEqual(notifier.calls[0].body, "Transcription failed")
     }
 
-    func testConfigurePipelineCallbacksTranscribingNoNotification() throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("appstate_callbacks_\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tmpDir) }
+    func testConfigureCallbacksTranscribingNoNotification() throws {
+        let tmpDir = try makeTempDirectory(prefix: "appstate_callbacks")
 
         let (state, notifier) = makeIsolatedState(logDir: tmpDir)
-        state.configurePipelineCallbacks()
+        state.pipeline.configureCallbacks()
 
-        state.pipelineQueue.onJobStateChange?(makeJob(), .waiting, .transcribing)
+        state.pipeline.queue.onJobStateChange?(makeJob(), .waiting, .transcribing)
 
         XCTAssertTrue(notifier.calls.isEmpty)
     }
@@ -457,9 +600,10 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
 
     func testStartManualRecordingSendsNotification() async {
         let (state, notifier) = makeState()
-        addTeardownBlock { state.watchLoop?.stop() }
+        state.permissions.handle(HealthCheckResult(screenRecording: .healthy, microphone: .healthy))
+        addTeardownBlock { state.watching.watchLoop?.stop() }
 
-        state.startManualRecording(pid: 1234, appName: "Chrome", title: "Standup")
+        state.watching.startManualRecording(pid: 1234, appName: "Chrome", title: "Standup")
         // Success → "Manual Recording" / hardware unavailable → "Error"
         await waitFor(!notifier.calls.isEmpty)
 
@@ -471,12 +615,13 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
 
     func testStartManualRecordingStopsExistingAutoWatchLoop() async {
         let (state, _) = makeState()
+        state.permissions.handle(HealthCheckResult(screenRecording: .healthy, microphone: .healthy))
         let (existingLoop, _) = makeTestWatchLoop()
         existingLoop.start()
-        state.watchLoop = existingLoop
+        state.watching.watchLoop = existingLoop
         XCTAssertTrue(existingLoop.isActive)
 
-        state.startManualRecording(pid: 1234, appName: "Chrome", title: "Standup")
+        state.watching.startManualRecording(pid: 1234, appName: "Chrome", title: "Standup")
         await waitFor(!existingLoop.isActive)
 
         XCTAssertFalse(existingLoop.isActive, "Existing auto-watch loop should be stopped")
@@ -488,42 +633,42 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         let settings = AppSettings()
         settings.transcriptionEngine = .whisperKit
         let state = AppState(settings: settings)
-        XCTAssertTrue(state.activeTranscriptionEngine is WhisperKitEngine)
+        XCTAssertTrue(state.engines.activeTranscriptionEngine is WhisperKitEngine)
     }
 
     func testActiveTranscriptionEngineReturnsParakeetWhenSet() {
         let settings = AppSettings()
         settings.transcriptionEngine = .parakeet
         let state = AppState(settings: settings)
-        XCTAssertTrue(state.activeTranscriptionEngine is ParakeetEngine)
+        XCTAssertTrue(state.engines.activeTranscriptionEngine is ParakeetEngine)
     }
 
     func testActiveTranscriptionEngineSwitchesBack() {
         let settings = AppSettings()
         settings.transcriptionEngine = .parakeet
         let state = AppState(settings: settings)
-        XCTAssertTrue(state.activeTranscriptionEngine is ParakeetEngine)
+        XCTAssertTrue(state.engines.activeTranscriptionEngine is ParakeetEngine)
 
         settings.transcriptionEngine = .whisperKit
-        XCTAssertTrue(state.activeTranscriptionEngine is WhisperKitEngine)
+        XCTAssertTrue(state.engines.activeTranscriptionEngine is WhisperKitEngine)
     }
 
-    func testMakePipelineQueueUsesActiveEngine() {
+    func testMakeQueueUsesActiveEngine() {
         let (state, _) = makeState()
-        XCTAssertNotNil(state.makePipelineQueue().engine, "WhisperKit engine should be set")
+        XCTAssertNotNil(state.pipeline.makeQueue().engine, "WhisperKit engine should be set")
 
         state.settings.transcriptionEngine = .parakeet
-        XCTAssertNotNil(state.makePipelineQueue().engine, "Parakeet engine should be set")
+        XCTAssertNotNil(state.pipeline.makeQueue().engine, "Parakeet engine should be set")
     }
 
-    func testEnsurePipelineQueueWithParakeet() {
+    func testEnsureQueueWithParakeet() {
         let settings = AppSettings()
         settings.transcriptionEngine = .parakeet
         let state = AppState(settings: settings)
 
-        state.ensurePipelineQueue()
+        state.pipeline.ensureQueue()
 
-        XCTAssertNotNil(state.pipelineQueue.engine)
+        XCTAssertNotNil(state.pipeline.queue.engine)
     }
 
     func testActiveTranscriptionEngineReturnsQwen3WhenSet() {
@@ -531,7 +676,7 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         let settings = AppSettings()
         settings.transcriptionEngine = .qwen3
         let state = AppState(settings: settings)
-        XCTAssertTrue(state.activeTranscriptionEngine is Qwen3AsrEngine)
+        XCTAssertTrue(state.engines.activeTranscriptionEngine is Qwen3AsrEngine)
     }
 
     func testActiveTranscriptionEngineSwitchesToQwen3AndBack() {
@@ -539,32 +684,32 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         let settings = AppSettings()
         settings.transcriptionEngine = .whisperKit
         let state = AppState(settings: settings)
-        XCTAssertTrue(state.activeTranscriptionEngine is WhisperKitEngine)
+        XCTAssertTrue(state.engines.activeTranscriptionEngine is WhisperKitEngine)
 
         settings.transcriptionEngine = .qwen3
-        XCTAssertTrue(state.activeTranscriptionEngine is Qwen3AsrEngine)
+        XCTAssertTrue(state.engines.activeTranscriptionEngine is Qwen3AsrEngine)
 
         settings.transcriptionEngine = .parakeet
-        XCTAssertTrue(state.activeTranscriptionEngine is ParakeetEngine)
+        XCTAssertTrue(state.engines.activeTranscriptionEngine is ParakeetEngine)
     }
 
-    func testMakePipelineQueueUsesQwen3Engine() {
+    func testMakeQueueUsesQwen3Engine() {
         guard #available(macOS 15, *) else { return }
         let settings = AppSettings()
         settings.transcriptionEngine = .qwen3
         let state = AppState(settings: settings)
-        XCTAssertNotNil(state.makePipelineQueue().engine, "Qwen3 engine should be set")
+        XCTAssertNotNil(state.pipeline.makeQueue().engine, "Qwen3 engine should be set")
     }
 
-    func testEnsurePipelineQueueWithQwen3() {
+    func testEnsureQueueWithQwen3() {
         guard #available(macOS 15, *) else { return }
         let settings = AppSettings()
         settings.transcriptionEngine = .qwen3
         let state = AppState(settings: settings)
 
-        state.ensurePipelineQueue()
+        state.pipeline.ensureQueue()
 
-        XCTAssertNotNil(state.pipelineQueue.engine)
+        XCTAssertNotNil(state.pipeline.queue.engine)
     }
 
     // MARK: - Qwen3 Fallback
@@ -576,29 +721,29 @@ final class AppStateTests: XCTestCase { // swiftlint:disable:this type_body_leng
         settings.transcriptionEngine = .qwen3
         let state = AppState(settings: settings)
         // On macOS 15+: Qwen3AsrEngine; on older: WhisperKit (fallback)
-        XCTAssertNotNil(state.activeTranscriptionEngine)
+        XCTAssertNotNil(state.engines.activeTranscriptionEngine)
     }
 
-    // MARK: - MakePipelineQueue Settings
+    // MARK: - makeQueue settings
 
-    func testMakePipelineQueueUsesDiarizeSettingFromSettings() {
+    func testMakeQueueUsesDiarizeSettingFromSettings() {
         let (state, _) = makeState()
         state.settings.diarize = true
-        let queue = state.makePipelineQueue()
+        let queue = state.pipeline.makeQueue()
         XCTAssertTrue(queue.diarizeEnabled)
     }
 
-    func testMakePipelineQueueUsesMicLabelFromSettings() {
+    func testMakeQueueUsesMicLabelFromSettings() {
         let (state, _) = makeState()
-        state.settings.micName = "Roman"
-        let queue = state.makePipelineQueue()
-        XCTAssertEqual(queue.micLabel, "Roman")
+        state.settings.micName = "Speaker A"
+        let queue = state.pipeline.makeQueue()
+        XCTAssertEqual(queue.micLabel, "Speaker A")
     }
 
-    func testMakePipelineQueueUsesNumSpeakersFromSettings() {
+    func testMakeQueueUsesNumSpeakersFromSettings() {
         let (state, _) = makeState()
         state.settings.numSpeakers = 4
-        let queue = state.makePipelineQueue()
+        let queue = state.pipeline.makeQueue()
         XCTAssertEqual(queue.numSpeakers, 4)
     }
 }

@@ -131,6 +131,29 @@ final class ProtocolGeneratorTests: XCTestCase {
         XCTAssertTrue(name.hasSuffix("_abcd.txt"))
     }
 
+    // MARK: - Slug Sanitization (Path Traversal Prevention)
+
+    func testSanitizeSlugStripsPathSeparators() {
+        let slug = ProtocolGenerator.sanitizeSlug("../../etc/passwd")
+        XCTAssertFalse(slug.contains("/"), "Slug must not contain path separators")
+        XCTAssertFalse(slug.contains(".."), "Slug must not contain parent directory traversal")
+    }
+
+    func testSanitizeSlugPreservesAlphanumericAndHyphens() {
+        let slug = ProtocolGenerator.sanitizeSlug("Team-Meeting 2024")
+        XCTAssertEqual(slug, "team-meeting_2024")
+    }
+
+    func testSanitizeSlugEmptyTitleFallback() {
+        let slug = ProtocolGenerator.sanitizeSlug("///")
+        XCTAssertEqual(slug, "meeting")
+    }
+
+    func testFilenameWithPathTraversalTitle() {
+        let name = ProtocolGenerator.filename(title: "../../etc/passwd", ext: "md")
+        XCTAssertFalse(name.contains("/"), "Filename must not contain path separators")
+    }
+
     // MARK: - Language Substitution
 
     func testApplyLanguageReplacesPlaceholder() {
@@ -149,12 +172,26 @@ final class ProtocolGeneratorTests: XCTestCase {
         XCTAssertTrue(ProtocolGenerator.protocolPrompt.contains("{LANGUAGE}"))
     }
 
+    // MARK: - System Prompt Construction
+
+    func testBuildSystemPromptSubstitutesLanguage() {
+        let prompt = ProtocolGenerator.buildSystemPrompt(diarized: false, language: "Polish")
+        XCTAssertTrue(prompt.contains("Polish"))
+        XCTAssertFalse(prompt.contains("{LANGUAGE}"))
+    }
+
+    func testBuildSystemPromptAppendsDiarizationNoteWhenDiarized() {
+        let plain = ProtocolGenerator.buildSystemPrompt(diarized: false, language: "German")
+        let diarized = ProtocolGenerator.buildSystemPrompt(diarized: true, language: "German")
+        XCTAssertGreaterThan(diarized.count, plain.count)
+        XCTAssertTrue(diarized.contains(ProtocolGenerator.diarizationNote))
+        XCTAssertFalse(plain.contains(ProtocolGenerator.diarizationNote))
+    }
+
     // MARK: - File Save Operations
 
     func testSaveTranscript() throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("proto_test_\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let tmpDir = try makeTempDirectory(prefix: "proto_test")
 
         let text = "[00:00] Hello\n[00:05] World"
         let url = try ProtocolGenerator.saveTranscript(text, title: "Test", dir: tmpDir)
@@ -167,9 +204,7 @@ final class ProtocolGeneratorTests: XCTestCase {
     }
 
     func testSaveProtocol() throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("proto_test_\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let tmpDir = try makeTempDirectory(prefix: "proto_test")
 
         let markdown = "# Meeting Protocol\n\n## Summary\nTest meeting."
         let url = try ProtocolGenerator.saveProtocol(markdown, title: "Standup", dir: tmpDir)
@@ -182,14 +217,8 @@ final class ProtocolGeneratorTests: XCTestCase {
     }
 
     func testSaveCreatesDirectory() throws {
-        let tmpDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("proto_test_\(UUID().uuidString)")
-            .appendingPathComponent("nested")
-        defer {
-            try? FileManager.default.removeItem(
-                at: tmpDir.deletingLastPathComponent(),
-            )
-        }
+        let parent = try makeTempDirectory(prefix: "proto_test")
+        let tmpDir = parent.appendingPathComponent("nested")
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: tmpDir.path))
 
@@ -241,61 +270,32 @@ final class ProtocolGeneratorTests: XCTestCase {
 
     // MARK: - Custom Prompt Loading
 
-    /// Run a test block with a temporary custom prompt file, restoring the original state afterwards.
-    private func withCustomPromptFile(_ body: (URL) throws -> Void) throws {
-        let url = AppPaths.customPromptFile
-        let fm = FileManager.default
-        let backup = fm.fileExists(atPath: url.path)
-            ? try? String(contentsOf: url, encoding: .utf8)
-            : nil
-        defer {
-            if let backup {
-                try? backup.write(to: url, atomically: true, encoding: .utf8)
-            } else {
-                try? fm.removeItem(at: url)
-            }
-        }
-        try body(url)
-    }
-
-    func testLoadPromptReturnsDefaultWhenNoFile() throws {
-        try withCustomPromptFile { url in
-            try? FileManager.default.removeItem(at: url)
-
-            let prompt = ProtocolGenerator.loadPrompt()
-            XCTAssertEqual(prompt, ProtocolGenerator.protocolPrompt)
-        }
+    func testLoadPromptReturnsDefaultWhenNoFile() {
+        let url = makeTempFile(suffix: ".md")
+        // File doesn't exist → loadPrompt falls back to the built-in default.
+        XCTAssertEqual(ProtocolGenerator.loadPrompt(from: url), ProtocolGenerator.protocolPrompt)
     }
 
     func testLoadPromptReadsCustomFile() throws {
-        try withCustomPromptFile { url in
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let custom = "Custom prompt for testing"
-            try custom.write(to: url, atomically: true, encoding: .utf8)
+        let url = makeTempFile(suffix: ".md")
+        let custom = "Custom prompt for testing"
+        try custom.write(to: url, atomically: true, encoding: .utf8)
 
-            let prompt = ProtocolGenerator.loadPrompt()
-            XCTAssertEqual(prompt, custom)
-        }
+        XCTAssertEqual(ProtocolGenerator.loadPrompt(from: url), custom)
     }
 
     func testLoadPromptIgnoresEmptyFile() throws {
-        try withCustomPromptFile { url in
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try "".write(to: url, atomically: true, encoding: .utf8)
+        let url = makeTempFile(suffix: ".md")
+        try "".write(to: url, atomically: true, encoding: .utf8)
 
-            let prompt = ProtocolGenerator.loadPrompt()
-            XCTAssertEqual(prompt, ProtocolGenerator.protocolPrompt)
-        }
+        XCTAssertEqual(ProtocolGenerator.loadPrompt(from: url), ProtocolGenerator.protocolPrompt)
     }
 
     func testLoadPromptIgnoresWhitespaceOnlyFile() throws {
-        try withCustomPromptFile { url in
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try "   \n  \n  ".write(to: url, atomically: true, encoding: .utf8)
+        let url = makeTempFile(suffix: ".md")
+        try "   \n  \n  ".write(to: url, atomically: true, encoding: .utf8)
 
-            let prompt = ProtocolGenerator.loadPrompt()
-            XCTAssertEqual(prompt, ProtocolGenerator.protocolPrompt)
-        }
+        XCTAssertEqual(ProtocolGenerator.loadPrompt(from: url), ProtocolGenerator.protocolPrompt)
     }
 
     #if !APPSTORE
@@ -371,5 +371,89 @@ final class ProtocolGeneratorTests: XCTestCase {
         let error: RecorderError = .unsupportedOS
         XCTAssertNotNil(error.errorDescription)
         XCTAssertEqual(error.errorDescription?.contains("14.2"), true)
+    }
+
+    // MARK: - filename timestamp-prefix compounding regression
+
+    func testStripExistingTimestampPrefix_HHmm() {
+        // The exact failure mode from PR #274: re-importing a previously-
+        // slug-renamed `<today1>_<original_stem>_app.wav` would feed the
+        // slug back as title, and filename would prepend ANOTHER today's
+        // timestamp → compounding.
+        XCTAssertEqual(
+            ProtocolGenerator.stripExistingTimestampPrefix("20260516_1319_20260503_174538"),
+            "20260503_174538",
+        )
+    }
+
+    func testStripExistingTimestampPrefix_HHmmss() {
+        // DualSourceRecorder's native format is `yyyyMMdd_HHmmss_<suffix>.wav`.
+        XCTAssertEqual(
+            ProtocolGenerator.stripExistingTimestampPrefix("20260503_174538_daily_standup"),
+            "daily_standup",
+        )
+    }
+
+    func testStripExistingTimestampPrefix_doubleCompound() {
+        // Multi-layer compound left over from earlier buggy runs — strip all layers.
+        XCTAssertEqual(
+            ProtocolGenerator.stripExistingTimestampPrefix("20260516_1601_20260516_1319_meeting"),
+            "meeting",
+        )
+    }
+
+    func testStripExistingTimestampPrefix_noPrefix() {
+        XCTAssertEqual(
+            ProtocolGenerator.stripExistingTimestampPrefix("Daily standup"),
+            "Daily standup",
+        )
+    }
+
+    func testStripExistingTimestampPrefix_titleIsOnlyTimestamp() {
+        // No trailing `_`, no suffix to keep — return original to avoid an empty slug.
+        XCTAssertEqual(
+            ProtocolGenerator.stripExistingTimestampPrefix("20260503_174538"),
+            "20260503_174538",
+        )
+    }
+
+    func testFilenameDoesNotCompoundOnReimport() {
+        // The actual regression: re-importing a previously-processed file with
+        // a slug stem should produce a single-prefixed filename, not stack
+        // today's prefix on top of yesterday's.
+        let result = ProtocolGenerator.filename(
+            title: "20260516_1319_20260503_174538", ext: "md",
+        )
+        // Today's timestamp + the original recording timestamp, NOT today's twice.
+        XCTAssertTrue(result.hasSuffix("_20260503_174538.md"), "got: \(result)")
+        XCTAssertFalse(
+            result.contains("_20260516_1319_"),
+            "yesterday's prefix should have been stripped: \(result)",
+        )
+    }
+
+    // MARK: - File permissions
+
+    /// Transcripts contain verbatim meeting speech — they must be owner-only
+    /// (0600), not world-readable from the inherited umask.
+    func testSaveTranscriptWritesOwnerOnlyPermissions() throws {
+        let dir = try makeTempDirectory(prefix: "ProtocolGenSaveTranscript")
+        let url = try ProtocolGenerator.saveTranscript("hello world", title: "Standup", dir: dir)
+
+        let mode = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int,
+        )
+        XCTAssertEqual(mode & 0o777, 0o600)
+    }
+
+    /// Protocol markdown summarises the meeting — same owner-only requirement.
+    func testSaveProtocolWritesOwnerOnlyPermissions() throws {
+        let dir = try makeTempDirectory(prefix: "ProtocolGenSaveProtocol")
+        let url = try ProtocolGenerator.saveProtocol("# Notes", title: "Standup", dir: dir)
+
+        let mode = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int,
+        )
+        XCTAssertEqual(mode & 0o777, 0o600)
     }
 }

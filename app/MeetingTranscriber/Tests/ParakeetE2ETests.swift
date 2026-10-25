@@ -7,8 +7,7 @@ final class ParakeetE2ETests: XCTestCase {
     // MARK: - Model loading
 
     func testParakeetModelLoadsSuccessfully() async throws {
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires Parakeet model download")
+        try skipIfCIWithoutE2EOptIn("requires Parakeet model download")
 
         let engine = ParakeetEngine()
         await engine.loadModel()
@@ -18,8 +17,7 @@ final class ParakeetE2ETests: XCTestCase {
     // MARK: - Transcription with fixture
 
     func testTranscribeSegmentsWithFixture() async throws {
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires Parakeet model download")
+        try skipIfCIWithoutE2EOptIn("requires Parakeet model download")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -33,7 +31,6 @@ final class ParakeetE2ETests: XCTestCase {
 
         // Resample 48kHz fixture to 16kHz for Parakeet
         let resampled16k = try resampleFixtureToTemp(fixture)
-        defer { try? FileManager.default.removeItem(at: resampled16k.deletingLastPathComponent()) }
 
         let segments = try await engine.transcribeSegments(audioPath: resampled16k)
 
@@ -52,8 +49,7 @@ final class ParakeetE2ETests: XCTestCase {
     }
 
     func testTranscribeSegmentsProducesGermanContent() async throws {
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires Parakeet model download")
+        try skipIfCIWithoutE2EOptIn("requires Parakeet model download")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -67,7 +63,6 @@ final class ParakeetE2ETests: XCTestCase {
 
         // Resample 48kHz fixture to 16kHz for Parakeet
         let resampled16k = try resampleFixtureToTemp(fixture)
-        defer { try? FileManager.default.removeItem(at: resampled16k.deletingLastPathComponent()) }
 
         let segments = try await engine.transcribeSegments(audioPath: resampled16k)
         XCTAssertFalse(segments.isEmpty, "Should produce at least one segment")
@@ -77,8 +72,7 @@ final class ParakeetE2ETests: XCTestCase {
     }
 
     func testTranscribeSegmentsGroupsIntoSentences() async throws {
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires Parakeet model download")
+        try skipIfCIWithoutE2EOptIn("requires Parakeet model download")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -92,7 +86,6 @@ final class ParakeetE2ETests: XCTestCase {
 
         // Resample 48kHz fixture to 16kHz for Parakeet
         let resampled16k = try resampleFixtureToTemp(fixture)
-        defer { try? FileManager.default.removeItem(at: resampled16k.deletingLastPathComponent()) }
 
         let segments = try await engine.transcribeSegments(audioPath: resampled16k)
 
@@ -106,8 +99,7 @@ final class ParakeetE2ETests: XCTestCase {
     // MARK: - Progress tracking
 
     func testDownloadProgressReachesOne() async throws {
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires Parakeet model download")
+        try skipIfCIWithoutE2EOptIn("requires Parakeet model download")
 
         let engine = ParakeetEngine()
         await engine.loadModel()
@@ -116,8 +108,7 @@ final class ParakeetE2ETests: XCTestCase {
     }
 
     func testTranscriptionProgressReachesOne() async throws {
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires Parakeet model download")
+        try skipIfCIWithoutE2EOptIn("requires Parakeet model download")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -131,7 +122,6 @@ final class ParakeetE2ETests: XCTestCase {
 
         // Resample 48kHz fixture to 16kHz for Parakeet
         let resampled16k = try resampleFixtureToTemp(fixture)
-        defer { try? FileManager.default.removeItem(at: resampled16k.deletingLastPathComponent()) }
 
         _ = try await engine.transcribeSegments(audioPath: resampled16k)
         XCTAssertEqual(
@@ -160,19 +150,9 @@ final class ParakeetE2ETests: XCTestCase {
         )
     }
 
-    private func fixtureURL(_ name: String = "two_speakers_de.wav") -> URL {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // Tests/
-            .appendingPathComponent("Fixtures")
-            .appendingPathComponent(name)
-    }
-
     /// Resample the 48kHz fixture to a 16kHz temp WAV file for Parakeet.
     private func resampleFixtureToTemp(_ fixture: URL) throws -> URL {
-        let tmpDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("parakeet_e2e_\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-
+        let tmpDir = try makeTempDirectory(prefix: "parakeet_e2e")
         let resampled16k = tmpDir.appendingPathComponent("resampled_16k.wav")
 
         let samples = try AudioMixer.loadAudioFileAsFloat32(url: fixture)
