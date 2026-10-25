@@ -272,6 +272,7 @@ final class RecordingNotifier: AppNotifying {
 /// Mock recorder that returns a pre-prepared fixture WAV as the recording result.
 @MainActor
 class MockRecorder: RecordingProvider {
+    var presenceFilename: String?
     var mixPath: URL?
     var appPath: URL?
     var micPath: URL?

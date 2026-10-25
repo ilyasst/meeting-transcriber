@@ -54,7 +54,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install tools
-        run: brew install swiftformat swiftlint
+        run: |
+          brew install swiftlint
+          curl --fail --location --retry 3 https://github.com/nicklockwood/SwiftFormat/releases/download/0.60.1/swiftformat.zip -o /tmp/swiftformat.zip
+          mkdir -p /tmp/swiftformat-pinned
+          unzip -q /tmp/swiftformat.zip -d /tmp/swiftformat-pinned
+          chmod +x /tmp/swiftformat-pinned/swiftformat
+          echo /tmp/swiftformat-pinned >> "$GITHUB_PATH"
       # SwiftFormat path list lives in scripts/lint.sh; calling it keeps CI and
       # local lint runs aligned. SwiftLint stays an explicit step to use the
       # github-actions-logging reporter (annotations in the PR diff).

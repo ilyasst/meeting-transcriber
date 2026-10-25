@@ -40,6 +40,7 @@ protocol RecordingProvider {
     /// active or the tap stopped delivering buffers in the last 0.5 s.
     /// Drives the menu-bar asymmetric-silence indicator. Default: -120
     /// (mocks that don't simulate audio levels stay silent).
+    var presenceFilename: String? { get }
     var appLevelDBFS: Double { get }
 
     /// Instantaneous mic level in dBFS, with the same semantics as
@@ -48,6 +49,10 @@ protocol RecordingProvider {
 }
 
 extension RecordingProvider {
+    var presenceFilename: String? {
+        nil
+    }
+
     var appLevelDBFS: Double {
         -120
     }
@@ -72,6 +77,10 @@ class DualSourceRecorder: RecordingProvider {
     private(set) var isRecording = false
     private(set) var recordingStartTime: TimeInterval = 0
     private var startTimestamp: String?
+
+    var presenceFilename: String? {
+        isRecording ? startTimestamp.map { "\($0)_mix.wav" } : nil
+    }
 
     var appLevelDBFS: Double {
         guard #available(macOS 14.2, *) else { return -120 }
