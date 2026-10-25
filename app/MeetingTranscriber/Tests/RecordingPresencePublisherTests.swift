@@ -29,7 +29,7 @@ final class RecordingPresencePublisherTests: XCTestCase {
         XCTAssertEqual(Set(final.keys), ["schema", "schema_version", "filename", "status", "started_at", "updated_at"])
     }
 
-    func testCancellationCannotBeOverwrittenByHeartbeat() {
+    func testCancellationCannotBeOverwrittenByHeartbeat() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let publisher = RecordingPresencePublisher(
@@ -39,7 +39,7 @@ final class RecordingPresencePublisherTests: XCTestCase {
         publisher.cancelled()
         publisher.heartbeat()
         publisher.stopped(filename: "fixture_mix.wav")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("synthetic-session.json").path))
+        XCTAssertEqual(try document(root.appendingPathComponent("synthetic-session.json"))["status"] as? String, "cancelled")
     }
 
     func testPublicationFailureDoesNotThrowOrPreventRetry() throws {
@@ -130,7 +130,8 @@ final class RecordingPresencePublisherTests: XCTestCase {
         try await loop.startManualRecording(pid: 9999, appName: "Fixture", title: "Synthetic capture")
         loop.stopManualRecording()
         let directory = root.appendingPathComponent("intake/recorder-presence")
-        XCTAssertTrue(try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).isEmpty)
+        let file = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first)
+        XCTAssertEqual(try document(file)["status"] as? String, "cancelled")
     }
 
     func testFailedExportRemovesTheActiveSignal() async throws {
@@ -149,7 +150,8 @@ final class RecordingPresencePublisherTests: XCTestCase {
         try await loop.startManualRecording(pid: 9999, appName: "Fixture", title: "Synthetic capture")
         loop.stopManualRecording()
         let directory = root.appendingPathComponent("intake/recorder-presence")
-        XCTAssertTrue(try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).isEmpty)
+        let file = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first)
+        XCTAssertEqual(try document(file)["status"] as? String, "cancelled")
     }
 
     private func document(_ url: URL) throws -> [String: Any] {
