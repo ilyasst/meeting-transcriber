@@ -76,11 +76,8 @@ final class RecordingPresencePublisher {
         guard !ended else { return }
         ended = true
         heartbeatTask?.cancel()
-        do {
-            if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
-        } catch {
-            presenceLogger.warning("Presence cleanup unavailable")
-        }
+        // Deletions may be retained by the sync receiver; a terminal update is durable.
+        publish(status: "cancelled", filename: filename)
     }
 
     private func publish(status: String, filename: String) {
