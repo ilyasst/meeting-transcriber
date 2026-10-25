@@ -37,7 +37,7 @@ final class AppPickerViewTests: XCTestCase {
         )
         let body = try sut.inspect()
         let button = try body.find(button: "Start Recording")
-        XCTAssertTrue(try button.isDisabled())
+        XCTAssertTrue(button.isDisabled())
     }
 
     func testCancelButtonExists() throws {
@@ -85,6 +85,20 @@ final class AppPickerViewTests: XCTestCase {
         let body = try sut.inspect()
         // TextField has placeholder "Meeting title (optional)"
         XCTAssertNoThrow(try body.find(ViewType.TextField.self))
+    }
+
+    // MARK: - Refresh button
+
+    func testRefreshButtonExists() throws {
+        let sut = AppPickerView(
+            appsProvider: MockAppsProvider(apps: testApps),
+            onStartRecording: { _, _, _ in },
+            onCancel: {},
+        )
+        let body = try sut.inspect()
+        let images = body.findAll(ViewType.Image.self)
+        let hasRefreshIcon = images.contains { (try? $0.actualImage().name()) == "arrow.clockwise" }
+        XCTAssertTrue(hasRefreshIcon, "Refresh button should exist in header")
     }
 
     // MARK: - Empty State

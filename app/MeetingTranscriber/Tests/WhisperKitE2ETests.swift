@@ -142,9 +142,15 @@ final class WhisperKitE2ETests: XCTestCase {
 
         let resampled = AudioMixer.resample(samples, from: sourceRate, to: targetRate)
 
-        // Compute RMS of both
-        let sourceRMS = sqrt(samples.map { $0 * $0 }.reduce(0, +) / Float(samples.count))
-        let targetRMS = sqrt(resampled.map { $0 * $0 }.reduce(0, +) / Float(resampled.count))
+        // Typed-binding split — the single-expression `sqrt(map.reduce / Float(...))`
+        // trips `-warn-long-expression-type-checking` on the CI mini under load.
+        let sourceSquared: [Float] = samples.map { $0 * $0 }
+        let sourceSum: Float = sourceSquared.reduce(0, +)
+        let sourceRMS: Float = sqrt(sourceSum / Float(samples.count))
+
+        let targetSquared: [Float] = resampled.map { $0 * $0 }
+        let targetSum: Float = targetSquared.reduce(0, +)
+        let targetRMS: Float = sqrt(targetSum / Float(resampled.count))
 
         // RMS should be similar (within 10%)
         XCTAssertEqual(
@@ -159,8 +165,7 @@ final class WhisperKitE2ETests: XCTestCase {
 
     func testTranscribeSegmentsWithFixture() async throws {
         // This test downloads a WhisperKit model (~1GB) - skip in CI
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires WhisperKit model download")
+        try skipIfCIWithoutE2EOptIn("requires WhisperKit model download")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -205,8 +210,7 @@ final class WhisperKitE2ETests: XCTestCase {
 
     func testTranscribeSegmentsHallucinationFilter() async throws {
         // This test downloads a WhisperKit model (~1GB) - skip in CI
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires WhisperKit model download")
+        try skipIfCIWithoutE2EOptIn("requires WhisperKit model download")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -234,8 +238,7 @@ final class WhisperKitE2ETests: XCTestCase {
 
     func testFullDualSourcePipeline() async throws {
         // This test downloads a WhisperKit model (~1GB) - skip in CI
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires WhisperKit model download")
+        try skipIfCIWithoutE2EOptIn("requires WhisperKit model download")
 
         let fixture = fixtureURL()
         try XCTSkipUnless(
@@ -262,10 +265,7 @@ final class WhisperKitE2ETests: XCTestCase {
         }
 
         // Save resampled audio to temp file
-        let tmpDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("whisperkit_e2e_\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let tmpDir = try makeTempDirectory(prefix: "whisperkit_e2e")
 
         let tmpWAV = tmpDir.appendingPathComponent("resampled_16k.wav")
         try AudioMixer.saveWAV(samples: resampled, sampleRate: targetRate, url: tmpWAV)
@@ -309,10 +309,7 @@ final class WhisperKitE2ETests: XCTestCase {
             "Fixture \(filename) not found",
         )
 
-        let tmpDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("multiformat_e2e_\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let tmpDir = try makeTempDirectory(prefix: "multiformat_e2e")
 
         // resampleFile uses loadAudioAsFloat32 → AVAudioFile or AVAsset fallback
         let resampled16k = tmpDir.appendingPathComponent("resampled_16k.wav")
@@ -352,9 +349,116 @@ final class WhisperKitE2ETests: XCTestCase {
         )
     }
 
+    // MARK: - Issues #256 / #339: Polish audio must transcribe as Polish, not English
+
+    /// E2E reproduction of issue #256. The bug reporter (Polish speaker) saw
+    /// most of their meeting "translated to English" because:
+    ///   1. `AppSettings.whisperLanguage` defaults to `"de"`, so a fresh-install
+    ///      Polish user gets German forced as language hint on Polish audio.
+    ///   2. The escape is to pick a different language — but `whisperLanguages`
+    ///      did not include `pl`, so the only option was empty/Auto-detect,
+    ///      which large-v3 drifts to English on Polish.
+    ///
+    /// This test exercises the "explicit Polish" path that becomes available
+    /// once Polish is added to the picker: with `engine.language = "pl"` and
+    /// a Polish-language fixture, the transcript should contain Polish-
+    /// specific characters and recognisable Polish words rather than English.
+    func testPolishAudioTranscribesAsPolishWithExplicitLanguage() async throws {
+        try skipIfCIWithoutE2EOptIn("requires WhisperKit model download")
+
+        let fixture = fixtureURL("polish_sample.wav")
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: fixture.path),
+            "Polish fixture not found at \(fixture.path)",
+        )
+
+        let engine = WhisperKitEngine()
+        engine.modelVariant = "openai_whisper-small"
+        engine.language = "pl"
+
+        await engine.loadModel()
+        XCTAssertEqual(engine.modelState, .loaded, "Model should be loaded")
+
+        let transcript = try await engine.transcribe(audioPath: fixture)
+        XCTAssertFalse(transcript.isEmpty, "Polish transcript should not be empty")
+        assertTranscriptIsPolishNotEnglish(transcript)
+    }
+
+    /// E2E reproduction of issue #339, the auto-detect counterpart of #256.
+    /// With "Auto-detect" selected (`engine.language = nil`), WhisperKit used
+    /// to skip language detection entirely (`DecodingOptions.detectLanguage`
+    /// defaults to false) and fall back to English. The fix enables detection
+    /// whenever no explicit language is pinned, so the same Polish fixture must
+    /// now transcribe as Polish without the user choosing a language.
+    func testPolishAudioTranscribesAsPolishWithAutoDetect() async throws {
+        try skipIfCIWithoutE2EOptIn("requires WhisperKit model download")
+
+        let fixture = fixtureURL("polish_sample.wav")
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: fixture.path),
+            "Polish fixture not found at \(fixture.path)",
+        )
+
+        let engine = WhisperKitEngine()
+        engine.modelVariant = "openai_whisper-small"
+        engine.language = nil // Auto-detect
+
+        await engine.loadModel()
+        XCTAssertEqual(engine.modelState, .loaded, "Model should be loaded")
+
+        let transcript = try await engine.transcribe(audioPath: fixture)
+        XCTAssertFalse(transcript.isEmpty, "Auto-detect transcript should not be empty")
+        assertTranscriptIsPolishNotEnglish(transcript)
+    }
+
+    /// Shared assertions for the Polish fixture: the transcript must look like
+    /// Polish (diacritics + word stems) and must not have drifted to English.
+    /// Used by both the explicit-language (#256) and auto-detect (#339) paths.
+    private func assertTranscriptIsPolishNotEnglish(_ transcript: String) {
+        let lower = transcript.lowercased()
+
+        // Polish letters that don't occur in English at all. `ó` is shared with
+        // other Romance/Slavic languages but never with English. Threshold ≥ 2:
+        // the 13s TTS fixture utters multiple words containing distinct
+        // diacritics, so any honest Polish transcript hits at least two; ≥ 3
+        // would be brittle against the small model dropping one diacritic.
+        let polishDiacritics: [Character] = ["\u{0105}", "\u{0107}", "\u{0119}", "\u{0142}", "\u{0144}", "\u{00F3}", "\u{015B}", "\u{017A}", "\u{017C}"]
+        let diacriticsFound = polishDiacritics.filter { lower.contains($0) }
+        XCTAssertGreaterThanOrEqual(
+            diacriticsFound.count, 2,
+            "Polish transcript should contain Polish-specific diacritics " +
+                "(found: \(diacriticsFound)). Transcript:\n\(transcript)",
+        )
+
+        // Words from the fixture's TTS content (substrings tolerant of TTS variations).
+        // Threshold ≥ 2 same rationale as diacritics — small model may drop
+        // one word but not most.
+        let polishWordRoots = ["dzi\u{0119}kuj", "witam", "projekt", "spotkaniu", "pytania", "plan"]
+        let matchedRoots = polishWordRoots.filter { lower.contains($0) }
+        XCTAssertGreaterThanOrEqual(
+            matchedRoots.count, 2,
+            "Polish transcript should contain at least 2 Polish word stems from " +
+                "\(polishWordRoots). Found \(matchedRoots). Transcript:\n\(transcript)",
+        )
+
+        // Negative guard: transcript must not be predominantly English.
+        // If WhisperKit drifted to translate-as-English, common English filler
+        // words would dominate. Two or more strict matches → likely English.
+        // The fixture script is pure Polish with no English brand names or
+        // loanwords, so the leading-space-bounded filler check has no false-
+        // positive vector here. If a future fixture mixes languages, this
+        // threshold needs revisiting.
+        let englishFillers = [" the ", " and ", " this ", " our ", " thank "]
+        let englishHits = englishFillers.filter { lower.contains($0) }
+        XCTAssertLessThanOrEqual(
+            englishHits.count, 1,
+            "Polish transcript looks like English (matches: \(englishHits)). " +
+                "Transcript:\n\(transcript)",
+        )
+    }
+
     func testTranscribeMultiFormatContent() async throws {
-        let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        try XCTSkipIf(isCI, "Skipping in CI: requires WhisperKit model download")
+        try skipIfCIWithoutE2EOptIn("requires WhisperKit model download")
 
         let engine = WhisperKitEngine()
         engine.modelVariant = "openai_whisper-small"
@@ -362,24 +466,22 @@ final class WhisperKitE2ETests: XCTestCase {
         await engine.loadModel()
         XCTAssertEqual(engine.modelState, .loaded)
 
-        let wavTranscript = try await transcribeFixture("two_speakers_de.wav", engine: engine)
-        let mp3Transcript = try await transcribeFixture("two_speakers_de.mp3", engine: engine)
-        let m4aTranscript = try await transcribeFixture("two_speakers_de.m4a", engine: engine)
-        let mp4Transcript = try await transcribeFixture("two_speakers_de.mp4", engine: engine)
+        // Each entry covers one ingestion path:
+        //   - WAV/MP3/M4A/MP4 ride the AVAudioFile/AVAsset tier of `AudioMixer`
+        //   - MKV/WebM/OGG only decode through the FFmpegHelper fallback,
+        //     so they're skipped on hosts without ffmpeg installed.
+        let stem = "two_speakers_de"
+        let formats: [(ext: String, label: String)] = [
+            ("wav", "WAV"), ("mp3", "MP3"), ("m4a", "M4A"), ("mp4", "MP4"),
+            ("mkv", "MKV"), ("webm", "WebM"), ("ogg", "OGG"),
+        ]
 
-        // Verify each format produces the expected German content
-        assertTranscriptContent(wavTranscript, format: "WAV")
-        assertTranscriptContent(mp3Transcript, format: "MP3")
-        assertTranscriptContent(m4aTranscript, format: "M4A")
-        assertTranscriptContent(mp4Transcript, format: "MP4")
-    }
-
-    // MARK: - Helpers
-
-    private func fixtureURL(_ name: String = "two_speakers_de.wav") -> URL {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // Tests/
-            .appendingPathComponent("Fixtures")
-            .appendingPathComponent(name)
+        for entry in formats {
+            if FFmpegHelper.ffmpegOnlyExtensions.contains(entry.ext), !FFmpegHelper.isAvailable {
+                continue
+            }
+            let transcript = try await transcribeFixture("\(stem).\(entry.ext)", engine: engine)
+            assertTranscriptContent(transcript, format: entry.label)
+        }
     }
 }

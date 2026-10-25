@@ -1,4 +1,7 @@
-import AVFoundation
+// `@preconcurrency`: AVFoundation isn't Sendable-annotated yet; the
+// AVAudioConverter input block runs synchronously, so the captured
+// AVAudioPCMBuffer is safe in practice.
+@preconcurrency import AVFoundation
 import Foundation
 import os.log
 
@@ -7,6 +10,25 @@ private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "AudioMi
 /// Audio mixing, echo suppression, mute masking, and resampling utilities.
 enum AudioMixer {
     // MARK: - Mix
+
+    /// Maximum plausible mic-to-app delay (seconds). Values beyond this indicate
+    /// a corrupted timestamp (e.g. device restart mid-recording, see #99).
+    static let maxMicDelay: TimeInterval = 30
+
+    /// Clamps `delay` to ±`maxMicDelay`. Logs a warning if clamping occurred —
+    /// excessive deltas usually mean the output device was switched mid-recording,
+    /// resetting the first-frame timestamp on one but not the other source.
+    static func clampMicDelay(_ delay: TimeInterval) -> TimeInterval {
+        let clamped = min(max(delay, -maxMicDelay), maxMicDelay)
+        if clamped != delay {
+            let delayStr = String(format: "%.2f", delay)
+            let clampedStr = String(format: "%.2f", clamped)
+            logger.warning(
+                "mic_delay_clamped original=\(delayStr, privacy: .public)s clamped=\(clampedStr, privacy: .public)s — possible output-device switch during recording",
+            )
+        }
+        return clamped
+    }
 
     /// Mix app and mic audio tracks into a single mono WAV.
     ///
@@ -21,25 +43,27 @@ enum AudioMixer {
         var appSamples = try loadAudioFileAsFloat32(url: appAudioPath)
         var micSamples = try loadAudioFileAsFloat32(url: micAudioPath)
 
+        let clampedDelay = clampMicDelay(micDelay)
+
         // Apply echo suppression
         if !appSamples.isEmpty && !micSamples.isEmpty {
             suppressEcho(
                 appSamples: appSamples,
                 micSamples: &micSamples,
                 sampleRate: sampleRate,
-                micDelay: micDelay,
+                micDelay: clampedDelay,
             )
         }
 
         // Align by mic delay (shift mic samples)
-        if micDelay > 0 {
-            let delaySamples = Int(micDelay * Double(sampleRate))
+        if clampedDelay > 0 {
+            let delaySamples = Int(clampedDelay * Double(sampleRate))
             if delaySamples > 0 && delaySamples < micSamples.count {
                 // Mic started later: prepend zeros
                 micSamples = [Float](repeating: 0, count: delaySamples) + micSamples
             }
-        } else if micDelay < 0 {
-            let delaySamples = Int(-micDelay * Double(sampleRate))
+        } else if clampedDelay < 0 {
+            let delaySamples = Int(-clampedDelay * Double(sampleRate))
             if delaySamples > 0 && delaySamples < appSamples.count {
                 // App started later: prepend zeros to app
                 appSamples = [Float](repeating: 0, count: delaySamples) + appSamples
@@ -174,13 +198,19 @@ enum AudioMixer {
         }
 
         var error: NSError?
-        var inputConsumed = false
+        // The converter input block is typed `@Sendable`, so a captured
+        // `var Bool` flag would trip Swift 6's concurrent-capture check —
+        // even though the block actually runs synchronously while
+        // `convert(to:error:withInputFrom:)` is on the stack. Box the flag
+        // in a reference type so the closure captures it by-reference.
+        final class InputState: @unchecked Sendable { var consumed = false }
+        let inputState = InputState()
         converter.convert(to: dstBuffer, error: &error) { _, outStatus in
-            if inputConsumed {
+            if inputState.consumed {
                 outStatus.pointee = .endOfStream
                 return nil
             }
-            inputConsumed = true
+            inputState.consumed = true
             outStatus.pointee = .haveData
             return srcBuffer
         }
@@ -229,12 +259,12 @@ enum AudioMixer {
             return (samples, sampleRate)
         } catch let audioFileError {
             // Fallback 1: AVAsset for video containers (MP4, MOV)
-            logger.info("AVAudioFile failed for \(url.lastPathComponent): \(audioFileError.localizedDescription), trying AVAsset fallback")
+            logger.info("AVAudioFile failed for \(url.lastPathComponent, privacy: .private): \(audioFileError.localizedDescription), trying AVAsset fallback")
             do {
                 return try await loadAudioFromAVAsset(url: url)
             } catch {
                 // Fallback 2: ffmpeg for unsupported formats
-                logger.info("AVAsset failed for \(url.lastPathComponent): \(error.localizedDescription), trying ffmpeg fallback")
+                logger.info("AVAsset failed for \(url.lastPathComponent, privacy: .private): \(error.localizedDescription), trying ffmpeg fallback")
                 return try await FFmpegHelper.loadAudioWithFFmpeg(url: url)
             }
         }
@@ -325,6 +355,22 @@ enum AudioMixer {
         return try readSamplesFromAudioFile(file)
     }
 
+    /// RMS in dBFS for a Float32 PCM sample buffer.
+    /// Returns `-Float.infinity` for an empty buffer (true silence).
+    static func rmsDecibels(samples: [Float]) -> Float {
+        guard !samples.isEmpty else { return -.infinity }
+        let sumSq = samples.reduce(Float(0)) { $0 + $1 * $1 }
+        let rms = (sumSq / Float(samples.count)).squareRoot()
+        return 20 * log10(max(rms, 1e-10))
+    }
+
+    /// Convenience: RMS in dBFS for a WAV / AVAudioFile-readable file.
+    /// Returns `nil` if the file cannot be read.
+    static func rmsDecibels(forFileAt url: URL) -> Float? {
+        guard let samples = try? loadAudioFileAsFloat32(url: url) else { return nil }
+        return rmsDecibels(samples: samples)
+    }
+
     /// Read mono Float32 samples from an already-opened AVAudioFile.
     private static func readSamplesFromAudioFile(_ file: AVAudioFile) throws -> [Float] {
         let format = file.processingFormat
@@ -396,6 +442,12 @@ enum AudioMixer {
         }
 
         try file.write(from: buffer)
+
+        // Restrict permissions to owner-only (0600) — audio may contain sensitive meeting content
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path,
+        )
     }
 }
 

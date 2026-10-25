@@ -1,6 +1,10 @@
 // MicRecorder is currently unused (DualSourceRecorder uses AudioTapLib directly).
 // Kept for potential future standalone mic recording feature.
-import AVFoundation
+import AudioTapLib
+
+// `@preconcurrency`: AVFoundation types lack Sendable annotations —
+// same gap as AudioMixer.swift; preemptively guarded.
+@preconcurrency import AVFoundation
 import CoreAudio
 import Foundation
 import os.log
@@ -22,6 +26,12 @@ class MicRecorder {
     ///   - deviceUID: CoreAudio device UID (nil = system default)
     ///   - sampleRate: Target sample rate (default 48000)
     func start(outputPath: URL, deviceUID: String? = nil, sampleRate: Double = 48000) throws { // swiftlint:disable:this unused_declaration
+        // No input device available (e.g. Mac Mini server without mic hardware) —
+        // accessing AVAudioEngine.inputNode would throw an uncatchable NSException.
+        guard AVCaptureDevice.default(for: .audio) != nil else {
+            throw MicRecorderError.noInputDevice
+        }
+
         let engine = AVAudioEngine()
 
         // Select input device if specified
@@ -60,7 +70,9 @@ class MicRecorder {
             channels: 1,
         )
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
+        // safeInstallTap bridges the uncatchable NSException installTap raises
+        // for a mismatched format (issue #379) into a Swift throw.
+        try inputNode.safeInstallTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
             guard let self, self.isRecording else { return }
             do {
                 try file.write(from: buffer)
@@ -140,27 +152,9 @@ class MicRecorder {
             }
             guard inputChannels > 0 else { continue }
 
-            // Get UID
-            var uidAddress = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyDeviceUID,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            )
-            var uid: CFString = "" as CFString
-            var uidSize = UInt32(MemoryLayout<CFString>.size)
-            guard AudioObjectGetPropertyData(deviceID, &uidAddress, 0, nil, &uidSize, &uid) == noErr else { continue }
-
-            // Get name
-            var nameAddress = AudioObjectPropertyAddress(
-                mSelector: kAudioObjectPropertyName,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            )
-            var name: CFString = "" as CFString
-            var nameSize = UInt32(MemoryLayout<CFString>.size)
-            guard AudioObjectGetPropertyData(deviceID, &nameAddress, 0, nil, &nameSize, &name) == noErr else { continue }
-
-            results.append((uid: uid as String, name: name as String, channels: inputChannels))
+            guard let uidValue = readCFStringAudioProperty(deviceID, kAudioDevicePropertyDeviceUID),
+                  let nameValue = readCFStringAudioProperty(deviceID, kAudioObjectPropertyName) else { continue }
+            results.append((uid: uidValue, name: nameValue, channels: inputChannels))
         }
         return results
     }
@@ -221,12 +215,14 @@ class MicRecorder {
 }
 
 enum MicRecorderError: LocalizedError {
+    case noInputDevice
     case formatCreationFailed
     case deviceNotFound(String)
     case deviceSetFailed(String, OSStatus)
 
     var errorDescription: String? {
         switch self {
+        case .noInputDevice: "No microphone hardware available"
         case .formatCreationFailed: "Failed to create audio format"
         case let .deviceNotFound(uid): "Audio device not found: \(uid)"
         case let .deviceSetFailed(uid, status): "Failed to set device \(uid): OSStatus \(status)"

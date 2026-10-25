@@ -78,14 +78,26 @@ enum ProtocolGenerator {
         prompt.replacingOccurrences(of: "{LANGUAGE}", with: language)
     }
 
-    static func loadPrompt() -> String {
-        let url = AppPaths.customPromptFile
+    /// Load the protocol generation prompt. Reads from `url` (default
+    /// `AppPaths.customPromptFile`) when present and non-empty; falls back
+    /// to the built-in `protocolPrompt`. The `url` parameter exists so tests
+    /// can use unique per-test paths instead of racing on the shared one.
+    static func loadPrompt(from url: URL = AppPaths.customPromptFile) -> String {
         if let custom = try? String(contentsOf: url, encoding: .utf8),
            !custom.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             logger.info("Using custom protocol prompt from \(url.path)")
             return custom
         }
         return protocolPrompt
+    }
+
+    /// Build the localized system prompt: `loadPrompt` + `applyLanguage`
+    /// + optional `diarizationNote`. Excludes the transcript itself —
+    /// callers append or attach it as they see fit.
+    static func buildSystemPrompt(diarized: Bool, language: String) -> String {
+        var prompt = applyLanguage(loadPrompt(), language: language)
+        if diarized { prompt += diarizationNote }
+        return prompt
     }
 
     // MARK: - File Operations
@@ -99,7 +111,9 @@ enum ProtocolGenerator {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent(filename(title: title, ext: "txt"))
         try text.write(to: url, atomically: true, encoding: .utf8)
-        logger.info("Transcript saved: \(url.lastPathComponent)")
+        // Transcripts contain verbatim meeting speech — restrict to owner-only.
+        try FileManager.default.restrictToOwner(url)
+        logger.info("Transcript saved: \(url.lastPathComponent, privacy: .private)")
         return url
     }
 
@@ -112,7 +126,9 @@ enum ProtocolGenerator {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent(filename(title: title, ext: "md"))
         try markdown.write(to: url, atomically: true, encoding: .utf8)
-        logger.info("Protocol saved: \(url.lastPathComponent)")
+        // Protocol markdown summarises the meeting — restrict to owner-only.
+        try FileManager.default.restrictToOwner(url)
+        logger.info("Protocol saved: \(url.lastPathComponent, privacy: .private)")
         return url
     }
 
@@ -122,13 +138,48 @@ enum ProtocolGenerator {
         return fmt
     }()
 
+    /// Sanitize a title into a safe filename slug (path-traversal safe).
+    /// Falls back to `"meeting"` if no allowed characters remain.
+    private static let slugAllowed = CharacterSet.alphanumerics
+        .union(CharacterSet(charactersIn: "-_"))
+
+    static func sanitizeSlug(_ title: String) -> String {
+        let slug = String(stripExistingTimestampPrefix(title)
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "_")
+            .unicodeScalars
+            .filter { slugAllowed.contains($0) }
+            .map(Character.init))
+        return slug.isEmpty ? "meeting" : slug
+    }
+
+    /// Re-importing a previously-processed recording feeds its slug-based stem
+    /// back as a title (e.g. `20260516_1319_20260503_174538`). `filename` would
+    /// then prepend ANOTHER `yyyyMMdd_HHmm_` → compounding-prefix loop on every
+    /// reprocess. Strip a leading `yyyyMMdd_HHmm[ss]_` so the slug stays
+    /// idempotent across reprocesses.
+    static func stripExistingTimestampPrefix(_ title: String) -> String {
+        let patterns = [#"^\d{8}_\d{6}_"#, #"^\d{8}_\d{4}_"#]
+        var result = title
+        // Apply repeatedly — input may already contain multiple compounded layers
+        // from earlier buggy runs; one call should normalize the worst case.
+        var changed = true
+        while changed {
+            changed = false
+            for pattern in patterns {
+                if let range = result.range(of: pattern, options: .regularExpression) {
+                    result.removeSubrange(range)
+                    changed = true
+                }
+            }
+        }
+        return result.isEmpty ? title : result
+    }
+
     /// Generate a filename: `{yyyyMMdd_HHmm}_{slug}.{ext}`
     static func filename(title: String, ext: String) -> String {
         let date = filenameFormatter.string(from: Date())
-        let slug = title
-            .lowercased()
-            .replacingOccurrences(of: " ", with: "_")
-            .filter { !"/:\\\u{0}".contains($0) }
+        let slug = sanitizeSlug(title)
         return "\(date)_\(slug).\(ext)"
     }
 }

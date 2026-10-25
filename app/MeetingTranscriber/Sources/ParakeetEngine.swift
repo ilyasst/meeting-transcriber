@@ -1,6 +1,9 @@
 import FluidAudio
 import Foundation
+import os.log
 import WhisperKit
+
+private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "ParakeetEngine")
 
 /// Transcription engine backed by NVIDIA Parakeet TDT v3 via FluidAudio CoreML.
 ///
@@ -9,21 +12,45 @@ import WhisperKit
 /// as the FluidAudio diarization models).
 @MainActor
 @Observable
-final class ParakeetEngine: TranscribingEngine {
+final class ParakeetEngine: TranscribingEngine, StreamingTranscribingEngine {
     private(set) var modelState: ModelState = .unloaded
     private(set) var downloadProgress: Double = 0
     private(set) var transcriptionProgress: Double = 0
 
+    /// Path to a custom vocabulary file for CTC boosting. Set from AppSettings before loadModel().
+    var customVocabularyPath: String = ""
+
+    /// Optional ISO 639-1 language hint. Empty/nil = auto-detect (FluidAudio's
+    /// v3 TDT decoder picks the script freely, which can drift Cyrillic ↔ Latin
+    /// on multi-script audio). Codes that don't match `FluidAudio.Language`
+    /// fall back to nil. Set from `AppSettings.parakeetLanguageOrNil`.
+    var language: String?
+
+    /// Maps `language` to the FluidAudio enum at call time. Kept private so
+    /// the public surface stays `String?` and AppState doesn't need to import
+    /// FluidAudio.
+    private var fluidLanguageHint: Language? {
+        guard let language, !language.isEmpty else { return nil }
+        return Language(rawValue: language)
+    }
+
     private var asrManager: AsrManager?
-    private var loadingTask: Task<Void, Never>?
+    private let modelLoad = SingleFlight()
+
+    // CTC vocabulary boosting state
+    private struct VocabularyBooster {
+        let context: CustomVocabularyContext
+        let spotter: CtcKeywordSpotter
+        let rescorer: VocabularyRescorer
+    }
+
+    private var vocabularyBooster: VocabularyBooster?
+
+    /// Tracks the last successfully configured vocabulary path to avoid redundant CTC model downloads.
+    private var currentVocabularyPath: String = ""
 
     func loadModel() async {
-        if let existing = loadingTask {
-            await existing.value
-            return
-        }
-
-        let task = Task {
+        await modelLoad.run { [self] in
             modelState = .downloading
             downloadProgress = 0
             do {
@@ -35,29 +62,31 @@ final class ParakeetEngine: TranscribingEngine {
                 modelState = .loading
                 downloadProgress = 1.0
                 let manager = AsrManager(config: .default)
-                try await manager.initialize(models: models)
+                try await manager.loadModels(models)
                 asrManager = manager
                 modelState = .loaded
+
+                // Configure custom vocabulary boosting if a vocabulary file is set
+                if !customVocabularyPath.isEmpty {
+                    try await configureVocabulary(from: customVocabularyPath)
+                }
             } catch {
-                NSLog("Parakeet model load failed: \(error)")
+                logger.error("Parakeet model load failed: \(error)")
                 modelState = .unloaded
                 downloadProgress = 0
             }
-            loadingTask = nil
         }
-        loadingTask = task
-        await task.value
     }
 
     private func ensureModel() async throws {
         if asrManager != nil { return }
-        NSLog("Parakeet: model not loaded, loading…")
+        logger.info("Parakeet: model not loaded, loading…")
         await loadModel()
         guard asrManager != nil else {
-            NSLog("Parakeet: model load FAILED, state=\(modelState)")
+            logger.error("Parakeet: model load FAILED, state=\(String(describing: self.modelState))")
             throw TranscriptionError.modelNotLoaded
         }
-        NSLog("Parakeet: model loaded successfully")
+        logger.info("Parakeet: model loaded successfully")
     }
 
     func transcribeSegments(audioPath: URL) async throws -> [TimestampedSegment] {
@@ -67,8 +96,16 @@ final class ParakeetEngine: TranscribingEngine {
         }
 
         transcriptionProgress = 0
-        let result = try await manager.transcribe(audioPath, source: .system)
+        var decoderState = await TdtDecoderState.make(decoderLayers: manager.decoderLayerCount)
+        var result = try await manager.transcribe(audioPath, decoderState: &decoderState, language: fluidLanguageHint)
         transcriptionProgress = 1.0
+
+        // Apply CTC vocabulary rescoring if configured
+        if vocabularyBooster?.rescorer != nil, let timings = result.tokenTimings, !timings.isEmpty {
+            result = try await applyVocabularyRescoring(
+                result: result, timings: timings, audioPath: audioPath,
+            )
+        }
 
         guard let timings = result.tokenTimings, !timings.isEmpty else {
             // No per-token timestamps: emit single segment spanning full duration
@@ -77,38 +114,109 @@ final class ParakeetEngine: TranscribingEngine {
             ]
         }
 
-        return Self.groupTokensIntoSegments(timings)
+        return ParakeetTokenGrouping.groupIntoSegments(timings)
     }
 
-    /// Group token-level timings into sentence-level `TimestampedSegment`s.
-    ///
-    /// Ends a segment at sentence-terminating punctuation (`. ! ?`) or
-    /// after 20 tokens to keep segment lengths reasonable.
-    private static func groupTokensIntoSegments(_ timings: [TokenTiming]) -> [TimestampedSegment] {
-        var segments: [TimestampedSegment] = []
-        var group: [TokenTiming] = []
-
-        for timing in timings {
-            let token = timing.token
-            guard !token.trimmingCharacters(in: CharacterSet.whitespaces).isEmpty else { continue }
-            group.append(timing)
-
-            let endsWithPunct = token.hasSuffix(".") || token.hasSuffix("!") || token.hasSuffix("?")
-            if endsWithPunct || group.count >= 20 {
-                if let seg = makeSegment(from: group) { segments.append(seg) }
-                group = []
-            }
+    /// Live transcription entry point: transcribe a raw 16 kHz mono Float32
+    /// buffer without going through disk. Returns the decoded text without
+    /// timestamps — `StreamingTranscriber` only needs the string to emit a
+    /// partial/final caption. Each call gets a fresh decoder state so callers
+    /// can be stateless across VAD segments.
+    func transcribeSamples(_ samples: [Float]) async throws -> String {
+        try await ensureModel()
+        guard let manager = asrManager else {
+            throw TranscriptionError.modelNotLoaded
         }
-        if let seg = makeSegment(from: group) { segments.append(seg) }
-
-        return segments
+        var decoderState = await TdtDecoderState.make(decoderLayers: manager.decoderLayerCount)
+        let result = try await manager.transcribe(
+            samples, decoderState: &decoderState, language: fluidLanguageHint,
+        )
+        return result.text.trimmingCharacters(in: .whitespaces)
     }
 
-    private static func makeSegment(from timings: [TokenTiming]) -> TimestampedSegment? {
-        guard !timings.isEmpty else { return nil }
-        let text = timings.map(\.token).joined().trimmingCharacters(in: CharacterSet.whitespaces)
-        guard !text.isEmpty else { return nil }
-        // swiftlint:disable:next force_unwrapping
-        return TimestampedSegment(start: timings.first!.startTime, end: timings.last!.endTime, text: text)
+    /// Run CTC keyword spotting on the audio and rescore the TDT transcript.
+    private func applyVocabularyRescoring(
+        result: ASRResult,
+        timings: [TokenTiming],
+        audioPath: URL,
+    ) async throws -> ASRResult {
+        guard let booster = vocabularyBooster else { return result }
+        // Audio is already 16kHz mono at this point (resampled by PipelineQueue)
+        let (audioSamples, _) = try await AudioMixer.loadAudioAsFloat32(url: audioPath)
+
+        let spotResult = try await booster.spotter.spotKeywordsWithLogProbs(
+            audioSamples: audioSamples,
+            customVocabulary: booster.context,
+        )
+        guard !spotResult.logProbs.isEmpty else { return result }
+
+        let rescoreOutput = booster.rescorer.ctcTokenRescore(
+            transcript: result.text,
+            tokenTimings: timings,
+            logProbs: spotResult.logProbs,
+            frameDuration: spotResult.frameDuration,
+        )
+
+        guard rescoreOutput.wasModified else { return result }
+
+        let detected = rescoreOutput.replacements.compactMap(\.replacementWord)
+        let applied = rescoreOutput.replacements.filter(\.shouldReplace).compactMap(\.replacementWord)
+        logger.info("Parakeet: vocabulary rescoring applied \(applied.count) replacement(s)")
+        // RescoreOutput only provides updated text — token timings are unchanged because
+        // rescoring performs word-level text substitution without altering timing boundaries.
+        return ASRResult(
+            text: rescoreOutput.text,
+            confidence: result.confidence,
+            duration: result.duration,
+            processingTime: result.processingTime,
+            tokenTimings: timings,
+            ctcDetectedTerms: detected.isEmpty ? nil : detected,
+            ctcAppliedTerms: applied.isEmpty ? nil : applied,
+        )
+    }
+
+    // MARK: - Custom Vocabulary
+
+    /// Configure custom vocabulary for CTC boosting (Parakeet only).
+    ///
+    /// Loads a vocabulary file and downloads CTC models for keyword spotting.
+    /// After configuration, `transcribeSegments` will automatically apply CTC-based
+    /// vocabulary rescoring to improve recognition of domain-specific terms.
+    ///
+    /// Skips silently if path is empty. Logs a warning if loading fails.
+    func configureVocabulary(from path: String) async throws {
+        guard !path.isEmpty else {
+            vocabularyBooster = nil
+            currentVocabularyPath = ""
+            return
+        }
+        guard path != currentVocabularyPath else { return }
+
+        let vocab: CustomVocabularyContext
+        let ctcModels: CtcModels
+        do {
+            (vocab, ctcModels) = try await CustomVocabularyContext.loadWithCtcTokens(
+                from: path,
+                ctcVariant: .ctc110m,
+            )
+        } catch {
+            logger.warning("Parakeet: failed to load vocabulary from \(path): \(error)")
+            return
+        }
+
+        let blankId = ctcModels.vocabulary.count
+        let spotter = CtcKeywordSpotter(models: ctcModels, blankId: blankId)
+
+        let ctcModelDir = CtcModels.defaultCacheDirectory(for: ctcModels.variant)
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: spotter,
+            vocabulary: vocab,
+            config: .default,
+            ctcModelDirectory: ctcModelDir,
+        )
+
+        vocabularyBooster = VocabularyBooster(context: vocab, spotter: spotter, rescorer: rescorer)
+        currentVocabularyPath = path
+        logger.info("Parakeet: custom vocabulary loaded: \(vocab.terms.count) terms")
     }
 }

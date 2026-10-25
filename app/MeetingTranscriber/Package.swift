@@ -1,4 +1,4 @@
-// swift-tools-version: 5.10
+// swift-tools-version: 6.2
 
 import PackageDescription
 
@@ -8,7 +8,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/nalexn/ViewInspector", from: "0.10.3"),
         .package(url: "https://github.com/pointfreeco/swift-snapshot-testing", from: "1.19.1"),
-        .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "0.17.0"),
+        .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "1.0.0"),
         .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.13.4"),
         .package(path: "../../tools/audiotap"),
     ],
@@ -21,7 +21,28 @@ let package = Package(
                 .product(name: "AudioTapLib", package: "audiotap"),
             ],
             path: "Sources",
-            exclude: ["Info.plist"]
+            // Assets.xcassets is compiled by `actool` in scripts/build_release.sh,
+            // not by SPM. Excluding silences "unhandled file" warnings without
+            // changing the runtime bundle.
+            exclude: ["Info.plist", "Assets.xcassets"],
+            // Treat any new compiler warning as a build failure so deprecations
+            // and concurrency hints are caught at PR time, not on a future
+            // dependency bump. Scoped to our targets only — does not propagate
+            // to WhisperKit/FluidAudio.
+            swiftSettings: [
+                .treatAllWarnings(as: .error),
+                // Surface accidental compile-time blowups. Type-checking a
+                // function body or expression beyond 300 ms is almost always
+                // a sign of pathological generic-overload search or deeply
+                // nested SwiftUI builders. Apple recommends 100 ms; 300 ms
+                // is the historical pre-Swift-6 setting that turned out to
+                // be sustainable once strict-concurrency analysis settled.
+                .unsafeFlags([
+                    "-Xfrontend", "-warn-long-function-bodies=300",
+                    "-Xfrontend", "-warn-long-expression-type-checking=300",
+                ]),
+                .enableUpcomingFeature("ExistentialAny"),
+            ]
         ),
         .testTarget(
             name: "MeetingTranscriberTests",
@@ -31,7 +52,19 @@ let package = Package(
                 .product(name: "SnapshotTesting", package: "swift-snapshot-testing"),
             ],
             path: "Tests",
-            exclude: ["Fixtures"]
+            // __Snapshots__ is the SnapshotTesting reference-image directory.
+            // Tests load these via filesystem path at runtime, not via the
+            // bundle, so SPM doesn't need to package them as resources.
+            exclude: ["Fixtures", "__Snapshots__"],
+            swiftSettings: [
+                .treatAllWarnings(as: .error),
+                .unsafeFlags([
+                    "-Xfrontend", "-warn-long-function-bodies=300",
+                    "-Xfrontend", "-warn-long-expression-type-checking=300",
+                ]),
+                .enableUpcomingFeature("ExistentialAny"),
+            ]
         ),
-    ]
+    ],
+    swiftLanguageModes: [.v6]
 )

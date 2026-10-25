@@ -1,7 +1,7 @@
 @testable import MeetingTranscriber
 import XCTest
 
-final class OpenAIProtocolGeneratorTests: XCTestCase {
+final class OpenAIProtocolGeneratorTests: XCTestCase { // swiftlint:disable:this balanced_xctest_lifecycle type_body_length
     // MARK: - SSE Line Parsing
 
     func testParseSSELineExtractsContent() {
@@ -96,4 +96,485 @@ final class OpenAIProtocolGeneratorTests: XCTestCase {
         )
         XCTAssertNil(gen.apiKey)
     }
+
+    // MARK: - SSE Multi-Line Joining
+
+    func testParseMultipleSSELinesJoined() {
+        let lines = [
+            #"data: {"choices":[{"delta":{"content":"Hello"}}]}"#,
+            #"data: {"choices":[{"delta":{"content":" world"}}]}"#,
+            "data: [DONE]",
+        ]
+        let parts = lines.compactMap { OpenAIProtocolGenerator.parseSSELine($0) }
+        let result = parts.joined()
+        XCTAssertEqual(result, "Hello world")
+    }
+
+    // MARK: - ProtocolError Descriptions
+
+    func testEmptyProtocolErrorDescription() {
+        let error = ProtocolError.emptyProtocol
+        let description = error.errorDescription ?? ""
+        XCTAssertTrue(description.contains("empty"), "Expected 'empty' in: \(description)")
+    }
+
+    func testHttpErrorDescription() {
+        let error = ProtocolError.httpError(503, "Service Unavailable")
+        let description = error.errorDescription ?? ""
+        XCTAssertTrue(description.contains("503"), "Expected status code in: \(description)")
+        XCTAssertTrue(description.contains("Service Unavailable"), "Expected body in: \(description)")
+    }
+
+    func testHttpErrorEmptyBody() {
+        let error = ProtocolError.httpError(500, "")
+        let description = error.errorDescription ?? ""
+        XCTAssertTrue(description.contains("500"), "Expected status code in: \(description)")
+        XCTAssertFalse(description.hasSuffix(": "), "Should not end with colon-space for empty body")
+    }
+
+    func testConnectionFailedErrorDescription() {
+        let error = ProtocolError.connectionFailed("timeout reached")
+        let description = error.errorDescription ?? ""
+        XCTAssertTrue(description.contains("timeout reached"), "Expected reason in: \(description)")
+        XCTAssertTrue(description.contains("Connection failed"), "Expected prefix in: \(description)")
+    }
+
+    // MARK: - Language Substitution
+
+    func testApplyLanguageSubstitution() {
+        let template = "Write the protocol in {LANGUAGE}. Use {LANGUAGE} consistently."
+        let result = ProtocolGenerator.applyLanguage(template, language: "French")
+        XCTAssertEqual(result, "Write the protocol in French. Use French consistently.")
+        XCTAssertFalse(result.contains("{LANGUAGE}"))
+    }
+
+    // MARK: - generate() via MockURLProtocol
+
+    // swiftlint:disable:next force_unwrapping
+    private static let testEndpoint = URL(string: "http://test.local/v1/chat/completions")!
+    private static let okSSE = "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\ndata: [DONE]\n"
+
+    override func tearDown() {
+        MockURLProtocol.handler = nil
+        MockURLProtocol.errorHandler = nil
+        MockURLProtocol.rawResponseHandler = nil
+        super.tearDown()
+    }
+
+    private func makeMockSession() -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        return URLSession(configuration: config)
+    }
+
+    private func makeGenerator(session: URLSession, apiKey: String? = nil) -> OpenAIProtocolGenerator {
+        OpenAIProtocolGenerator(
+            endpoint: Self.testEndpoint,
+            model: "test-model",
+            language: "German",
+            apiKey: apiKey,
+            session: session,
+        )
+    }
+
+    private func mockResponse(_ request: URLRequest, status: Int = 200, body: Data = Data()) -> (HTTPURLResponse, Data) {
+        // swiftlint:disable:next force_unwrapping
+        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+        return (response, body)
+    }
+
+    func testGenerateSuccessfulSSEStream() async throws {
+        let sseBody = """
+        data: {"choices":[{"delta":{"role":"assistant"}}]}
+        data: {"choices":[{"delta":{"content":"# Protocol"}}]}
+        data: {"choices":[{"delta":{"content":"\\nContent here"}}]}
+        data: [DONE]
+        """
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+            return self.mockResponse(request, body: Data(sseBody.utf8))
+        }
+
+        let gen = makeGenerator(session: makeMockSession())
+        let result = try await gen.generate(transcript: "Test transcript", title: "Test", diarized: false)
+        XCTAssertTrue(result.contains("Protocol"))
+        XCTAssertTrue(result.contains("Content here"))
+    }
+
+    func testGenerateSetsAuthorizationHeader() async throws {
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer sk-test-123")
+            return self.mockResponse(request, body: Data(Self.okSSE.utf8))
+        }
+
+        let gen = makeGenerator(session: makeMockSession(), apiKey: "sk-test-123")
+        _ = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+    }
+
+    func testGenerateNoAuthHeaderWhenKeyNil() async throws {
+        MockURLProtocol.handler = { request in
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            return self.mockResponse(request, body: Data(Self.okSSE.utf8))
+        }
+
+        let gen = makeGenerator(session: makeMockSession())
+        _ = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+    }
+
+    func testGenerateDiarizedDoesNotThrow() async throws {
+        MockURLProtocol.handler = { request in
+            self.mockResponse(request, body: Data(Self.okSSE.utf8))
+        }
+
+        let gen = makeGenerator(session: makeMockSession())
+        let result = try await gen.generate(transcript: "Test", title: "Test", diarized: true)
+        XCTAssertFalse(result.isEmpty)
+    }
+
+    func testGenerateHTTPErrorThrows() async throws {
+        MockURLProtocol.handler = { request in
+            self.mockResponse(request, status: 503, body: Data("Service Unavailable".utf8))
+        }
+
+        let gen = makeGenerator(session: makeMockSession())
+        do {
+            _ = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+            XCTFail("Expected httpError")
+        } catch let error as ProtocolError {
+            if case let .httpError(code, body) = error {
+                XCTAssertEqual(code, 503)
+                XCTAssertTrue(body.contains("Service Unavailable"))
+            } else {
+                XCTFail("Expected httpError, got \(error)")
+            }
+        }
+    }
+
+    func testGenerateEmptyResponseThrows() async throws {
+        MockURLProtocol.handler = { request in
+            self.mockResponse(request, body: Data("data: [DONE]\n".utf8))
+        }
+
+        let gen = makeGenerator(session: makeMockSession())
+        do {
+            _ = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+            XCTFail("Expected emptyProtocol")
+        } catch let error as ProtocolError {
+            if case .emptyProtocol = error { /* expected */ } else {
+                XCTFail("Expected emptyProtocol, got \(error)")
+            }
+        }
+    }
+
+    func testGenerateTransportErrorMapsToConnectionFailed() async throws {
+        // session.bytes(for:) rethrows the transport-layer URLError; generate()
+        // must wrap it as ProtocolError.connectionFailed rather than leak it.
+        MockURLProtocol.errorHandler = { _ in URLError(.cannotConnectToHost) }
+
+        let gen = makeGenerator(session: makeMockSession())
+        do {
+            _ = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+            XCTFail("Expected connectionFailed")
+        } catch let error as ProtocolError {
+            if case let .connectionFailed(reason) = error {
+                XCTAssertFalse(reason.isEmpty, "Expected a non-empty failure reason")
+            } else {
+                XCTFail("Expected connectionFailed, got \(error)")
+            }
+        }
+    }
+
+    // MARK: - testConnection() via MockURLProtocol
+
+    func testTestConnectionSuccess() async {
+        let modelsJSON = #"{"data":[{"id":"llama3"},{"id":"mistral"}]}"#
+        MockURLProtocol.handler = { request in
+            self.mockResponse(request, body: Data(modelsJSON.utf8))
+        }
+
+        let result = await OpenAIProtocolGenerator.testConnection(
+            endpoint: "http://test.local/v1/chat/completions",
+            model: "test",
+            apiKey: nil,
+            session: makeMockSession(),
+        )
+        if case let .success(models) = result {
+            XCTAssertEqual(models, ["llama3", "mistral"])
+        } else {
+            XCTFail("Expected success")
+        }
+    }
+
+    func testTestConnectionHTTPError() async {
+        MockURLProtocol.handler = { request in
+            self.mockResponse(request, status: 401)
+        }
+
+        let result = await OpenAIProtocolGenerator.testConnection(
+            endpoint: "http://test.local/v1/chat/completions",
+            model: "test",
+            apiKey: nil,
+            session: makeMockSession(),
+        )
+        if case let .failure(error) = result, let pe = error as? ProtocolError, case let .httpError(code, _) = pe {
+            XCTAssertEqual(code, 401)
+        } else {
+            XCTFail("Expected httpError(401)")
+        }
+    }
+
+    func testTestConnectionTransportErrorMapsToConnectionFailed() async {
+        // session.data(for:) rethrows the transport-layer URLError; testConnection
+        // must surface it as a connectionFailed failure rather than crash/leak.
+        MockURLProtocol.errorHandler = { _ in URLError(.cannotConnectToHost) }
+
+        let result = await OpenAIProtocolGenerator.testConnection(
+            endpoint: "http://test.local/v1/chat/completions",
+            model: "test",
+            apiKey: nil,
+            session: makeMockSession(),
+        )
+        if case let .failure(error) = result, let pe = error as? ProtocolError, case .connectionFailed = pe {
+            // expected
+        } else {
+            XCTFail("Expected connectionFailed failure, got \(result)")
+        }
+    }
+
+    func testGenerateNonHTTPResponseThrowsConnectionFailed() async {
+        // A delivered response that isn't an HTTPURLResponse must map to
+        // .connectionFailed("Invalid response") — generate()'s
+        // `response as? HTTPURLResponse` guard, not a crash or hang.
+        MockURLProtocol.rawResponseHandler = { request in
+            // swiftlint:disable:next force_unwrapping
+            let response = URLResponse(url: request.url!, mimeType: "text/plain", expectedContentLength: 0, textEncodingName: nil)
+            return (response, Data())
+        }
+
+        let gen = makeGenerator(session: makeMockSession())
+        do {
+            _ = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+            XCTFail("Expected connectionFailed")
+        } catch let error as ProtocolError {
+            guard case .connectionFailed = error else {
+                XCTFail("Expected connectionFailed, got \(error)")
+                return
+            }
+        } catch {
+            XCTFail("Expected ProtocolError.connectionFailed, got \(error)")
+        }
+    }
+
+    func testTestConnectionMalformed2xxBodyReturnsEmptySuccess() async {
+        // A 2xx whose JSON lacks a "data" array is a soft success with no
+        // models, not a failure.
+        MockURLProtocol.handler = { request in
+            self.mockResponse(request, body: Data(#"{"object":"list"}"#.utf8))
+        }
+
+        let result = await OpenAIProtocolGenerator.testConnection(
+            endpoint: "http://test.local/v1/chat/completions",
+            model: "test",
+            apiKey: nil,
+            session: makeMockSession(),
+        )
+        if case let .success(models) = result {
+            XCTAssertEqual(models, [])
+        } else {
+            XCTFail("Expected empty success, got \(result)")
+        }
+    }
+
+    func testTestConnectionSortsModelNames() async {
+        // Model ids are returned sorted regardless of the server's order.
+        let modelsJSON = #"{"data":[{"id":"mistral"},{"id":"alpaca"},{"id":"llama3"}]}"#
+        MockURLProtocol.handler = { request in
+            self.mockResponse(request, body: Data(modelsJSON.utf8))
+        }
+
+        let result = await OpenAIProtocolGenerator.testConnection(
+            endpoint: "http://test.local/v1/chat/completions",
+            model: "test",
+            apiKey: nil,
+            session: makeMockSession(),
+        )
+        if case let .success(models) = result {
+            XCTAssertEqual(models, ["alpaca", "llama3", "mistral"])
+        } else {
+            XCTFail("Expected success, got \(result)")
+        }
+    }
+
+    func testTestConnectionInvalidEndpoint() async {
+        let result = await OpenAIProtocolGenerator.testConnection(
+            endpoint: "",
+            model: "test",
+            apiKey: nil,
+        )
+        if case .failure = result { /* expected */ } else {
+            XCTFail("Expected failure for empty endpoint")
+        }
+    }
+
+    // MARK: - Endpoint Base-URL Handling (issue #363)
+
+    func testTestConnectionDerivesModelsURLFromBaseURL() async {
+        // Issue #363: the OpenAI ecosystem convention (and LM Studio's own UI)
+        // is to enter the *base URL* ".../v1". Fetch Models must then hit
+        // ".../v1/models", NOT ".../models" (which 404s on LM Studio).
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(
+                request.url?.absoluteString,
+                "http://test.local/v1/models",
+                "base URL '/v1' must resolve to '/v1/models', not '/models'",
+            )
+            return self.mockResponse(request, body: Data(#"{"data":[]}"#.utf8))
+        }
+
+        let result = await OpenAIProtocolGenerator.testConnection(
+            endpoint: "http://test.local/v1",
+            model: "test",
+            apiKey: nil,
+            session: makeMockSession(),
+        )
+        // Non-vacuity: prove the request was actually issued (handler reached),
+        // so the in-handler URL assertion above is not skipped.
+        guard case .success = result else {
+            XCTFail("Expected the models request to be issued, got \(result)")
+            return
+        }
+    }
+
+    func testGeneratePostsToChatCompletionsFromBaseURL() async throws {
+        // Issue #363: with the base URL ".../v1", generate() must POST to
+        // ".../v1/chat/completions", not to ".../v1" itself (which 404s and
+        // makes summarization fail).
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(
+                request.url?.absoluteString,
+                "http://test.local/v1/chat/completions",
+                "base URL '/v1' must POST to '/v1/chat/completions'",
+            )
+            return self.mockResponse(request, body: Data(Self.okSSE.utf8))
+        }
+
+        let gen = try OpenAIProtocolGenerator(
+            endpoint: XCTUnwrap(URL(string: "http://test.local/v1")),
+            model: "test-model",
+            language: "German",
+            session: makeMockSession(),
+        )
+        // Non-vacuity: the "OK" body is only reachable through the mock, so a
+        // matching result proves the request was issued and the in-handler URL
+        // assertion above actually ran.
+        let result = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+        XCTAssertEqual(result, "OK")
+    }
+
+    // MARK: - Full Protocol Roundtrip
+
+    func testFullProtocolRoundtrip() async throws {
+        let sseChunks = [
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"# Meeting\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" Protocol\\n\\n\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"## Summary\\n\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Discussion about project status.\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\\n\\n## Action Items\\n\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"- Review PR by Friday\"}}]}",
+            "data: [DONE]",
+        ]
+        let sseBody = sseChunks.joined(separator: "\n")
+
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+            return self.mockResponse(request, body: Data(sseBody.utf8))
+        }
+
+        let gen = makeGenerator(session: makeMockSession())
+        let transcript = """
+        [00:00] Alice: Let's discuss the project status.
+        [00:15] Bob: The PR is ready for review.
+        [00:30] Alice: Please review it by Friday.
+        """
+
+        let result = try await gen.generate(
+            transcript: transcript,
+            title: "Sprint Planning",
+            diarized: true,
+        )
+
+        XCTAssertTrue(result.contains("# Meeting Protocol"))
+        XCTAssertTrue(result.contains("## Summary"))
+        XCTAssertTrue(result.contains("Discussion about project status."))
+        XCTAssertTrue(result.contains("## Action Items"))
+        XCTAssertTrue(result.contains("Review PR by Friday"))
+    }
+
+    func testRoundtripWithSpecialCharacters() async throws {
+        let sseLines = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Ä Ö Ü ß\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" — \\\"quotes\\\" & <html>\"}}]}",
+            "data: [DONE]",
+        ]
+        let sseBody = sseLines.joined(separator: "\n")
+        MockURLProtocol.handler = { request in
+            self.mockResponse(request, body: Data(sseBody.utf8))
+        }
+
+        let gen = makeGenerator(session: makeMockSession())
+        let result = try await gen.generate(transcript: "Test", title: "Test", diarized: false)
+
+        XCTAssertTrue(result.contains("Ä Ö Ü ß"))
+        XCTAssertTrue(result.contains("\"quotes\""))
+    }
+}
+
+// MARK: - MockURLProtocol
+
+private final class MockURLProtocol: URLProtocol {
+    // URLSession serialises protocol callbacks per task; the handler is set
+    // before the request is started and cleared in tearDown. No real race.
+    nonisolated(unsafe) static var handler: ((URLRequest) -> (HTTPURLResponse, Data))?
+    // When set, the request fails at the transport layer with this error
+    // (mirrors a connection refused / DNS failure / dropped socket). Takes
+    // precedence over `handler` so the generator's catch path is exercised.
+    nonisolated(unsafe) static var errorHandler: ((URLRequest) -> any Error)?
+    // When set, delivers a NON-HTTP `URLResponse` (takes precedence over
+    // `handler`) so the generator's `response as? HTTPURLResponse` guard fails.
+    nonisolated(unsafe) static var rawResponseHandler: ((URLRequest) -> (URLResponse, Data))?
+
+    override static func canInit(with _: URLRequest) -> Bool {
+        true
+    }
+
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        if let errorHandler = Self.errorHandler {
+            client?.urlProtocol(self, didFailWithError: errorHandler(request))
+            return
+        }
+        if let rawResponseHandler = Self.rawResponseHandler {
+            let (response, data) = rawResponseHandler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        let (response, data) = handler(request)
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

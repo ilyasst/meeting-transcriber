@@ -2,7 +2,7 @@
 # Build a self-contained MeetingTranscriber.app bundle.
 #
 # Usage:
-#   ./scripts/build_release.sh [--no-notarize] [--appstore]
+#   ./scripts/build_release.sh [--no-notarize] [--staple] [--appstore]
 #
 # Output:
 #   .build/release/MeetingTranscriber.dmg
@@ -12,6 +12,21 @@
 #   - Xcode Command Line Tools (swift, codesign, hdiutil)
 
 set -euo pipefail
+
+# === Sourceable helpers (no side effects on source) ===
+
+# Returns first 40-hex codesigning identity SHA-1 hash, or empty string if none.
+# `|| true` guards against grep exit-1 (no match) propagating under pipefail.
+detect_sign_hash() {
+    security find-identity -v -p codesigning 2>/dev/null \
+        | grep -oE '[0-9A-F]{40}' | head -1 || true
+}
+
+# === Source guard: only run the build when executed, not when sourced ===
+
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    return 0
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -30,11 +45,13 @@ MACOS_DIR="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 
 NOTARIZE=true
+STAPLE=false
 APPSTORE=false
 OVERRIDE_VERSION=""
 for arg in "$@"; do
     case "$arg" in
         --no-notarize) NOTARIZE=false ;;
+        --staple) STAPLE=true ;;
         --appstore) APPSTORE=true ;;
         --version=*) OVERRIDE_VERSION="${arg#--version=}" ;;
     esac
@@ -48,6 +65,7 @@ else
 fi
 echo "Building MeetingTranscriber v${VERSION}"
 echo "  Notarize:    $NOTARIZE"
+echo "  Staple:      $STAPLE"
 echo "  App Store:   $APPSTORE"
 echo "======================================="
 
@@ -135,10 +153,35 @@ if [ "$NOTARIZE" = true ]; then
         --options runtime --timestamp --entitlements "$ENTITLEMENTS" \
         "$APP_BUNDLE"
     echo "  Signed with Developer ID for notarization"
+
+    # When --staple is set, notarize and staple the .app itself so Gatekeeper
+    # does not need to contact Apple online when the app is launched (cask
+    # installs strip the DMG context, so the DMG ticket alone is not sufficient).
+    if [ "$STAPLE" = true ]; then
+        if [ -z "${APPLE_ID:-}" ] || [ -z "${TEAM_ID:-}" ] || [ -z "${APP_PASSWORD:-}" ]; then
+            echo "  ERROR: APPLE_ID, TEAM_ID, and APP_PASSWORD must be set for notarization."
+            exit 1
+        fi
+
+        echo "  Notarizing .app bundle..."
+        APP_ZIP="$BUILD_DIR/MeetingTranscriber-app.zip"
+        rm -f "$APP_ZIP"
+        ditto -c -k --keepParent "$APP_BUNDLE" "$APP_ZIP"
+        xcrun notarytool submit "$APP_ZIP" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" \
+            --password "$APP_PASSWORD" \
+            --wait
+        rm -f "$APP_ZIP"
+
+        echo "  Stapling notarization ticket to .app..."
+        xcrun stapler staple "$APP_BUNDLE"
+        xcrun stapler validate "$APP_BUNDLE"
+    fi
 else
-    # Use local development certificate if available
-    SIGN_HASH=$(security find-identity -v -p codesigning 2>/dev/null | head -1 | awk '{print $2}')
-    if [ -n "$SIGN_HASH" ] && [ "$SIGN_HASH" != "0" ]; then
+    # Use local development certificate if available (extract 40-char hex SHA-1 hash)
+    SIGN_HASH=$(detect_sign_hash)
+    if [ -n "$SIGN_HASH" ]; then
         codesign --deep --force --sign "$SIGN_HASH" --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
         echo "  Signed with certificate: $SIGN_HASH"
     else
@@ -187,13 +230,22 @@ if [ -z "${HOMEBREW_TEMP:-}" ]; then
             exit 1
         fi
 
+        WAIT_FLAG=""
+        [ "$STAPLE" = true ] && WAIT_FLAG="--wait"
+
         xcrun notarytool submit "$DMG_PATH" \
             --apple-id "$APPLE_ID" \
             --team-id "$TEAM_ID" \
-            --password "$APP_PASSWORD"
+            --password "$APP_PASSWORD" \
+            $WAIT_FLAG
 
-        echo "  DMG submitted for notarization (no --wait, no staple)"
-        echo "  Gatekeeper will verify online when users open the DMG"
+        if [ "$STAPLE" = true ]; then
+            echo "  Stapling notarization ticket to DMG..."
+            xcrun stapler staple "$DMG_PATH"
+            xcrun stapler validate "$DMG_PATH"
+        else
+            echo "  DMG submitted for notarization (Gatekeeper will verify online)"
+        fi
     fi
 else
     echo ""
