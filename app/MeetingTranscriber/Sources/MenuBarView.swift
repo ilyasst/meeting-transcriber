@@ -21,7 +21,8 @@ struct MenuBarView: View {
         status?.state ?? .idle
     }
 
-    var body: some View {
+    @ViewBuilder
+    private var statusHeader: some View {
         // Status header
         VStack(alignment: .leading, spacing: 2) {
             Label(state.label, systemImage: state.icon)
@@ -57,6 +58,10 @@ struct MenuBarView: View {
                 .foregroundStyle(.red)
                 .padding(.horizontal, 4)
         }
+    }
+
+    var body: some View {
+        statusHeader
 
         Divider()
 
