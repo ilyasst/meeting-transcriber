@@ -241,11 +241,11 @@ class WatchLoop {
         var failureMessage: String?
         do {
             let recording = try recorder.stop()
-            enqueueRecording(
+            let exported = enqueueRecording(
                 title: info.title, appName: info.appName, recording: recording,
                 destination: manualRecordOnlyDestination,
             )
-            manualPresence?.stopped(filename: recording.mixPath.lastPathComponent)
+            if exported { manualPresence?.stopped(filename: recording.mixPath.lastPathComponent) }
         } catch {
             logger.error("Failed to stop manual recording: \(error)")
             failureMessage = error.localizedDescription
@@ -384,14 +384,14 @@ class WatchLoop {
         let recording = try recorder.stop()
 
         // --- Enqueue for background processing ---
-        enqueueRecording(
+        let exported = enqueueRecording(
             title: title,
             appName: meeting.pattern.appName,
             recording: recording,
             participants: participants,
             destination: destination,
         )
-        presence?.stopped(filename: recording.mixPath.lastPathComponent)
+        if exported { presence?.stopped(filename: recording.mixPath.lastPathComponent) }
     }
 
     // MARK: - Meeting End Detection
@@ -435,16 +435,15 @@ class WatchLoop {
         recording: RecordingResult,
         participants: [String] = [],
         destination: RecordOnlyDestination? = nil,
-    ) {
+    ) -> Bool {
         if let destination {
-            writeRecordOnlySidecar(
+            return writeRecordOnlySidecar(
                 title: title,
                 appName: appName,
                 recording: recording,
                 participants: participants,
                 destination: destination,
             )
-            return
         }
 
         let job = PipelineJob(
@@ -458,6 +457,7 @@ class WatchLoop {
         )
         pipelineQueue?.enqueue(job)
         logger.info("Enqueued pipeline job for: \(title, privacy: .private)")
+        return true
     }
 
     /// Convert a `ProcessInfo.systemUptime`-based timestamp captured at recording
@@ -473,7 +473,7 @@ class WatchLoop {
         recording: RecordingResult,
         participants: [String],
         destination: RecordOnlyDestination,
-    ) {
+    ) -> Bool {
         let stoppedAt = Date()
         let startedAt = wallClockDate(forUptime: recording.recordingStart, now: stoppedAt)
 
@@ -511,6 +511,7 @@ class WatchLoop {
             )
             try sidecar.write(toDirectory: destDir, basename: basename)
             logger.info("Record-only: wrote sidecar + WAVs to \(destDir.path) for \(title, privacy: .private)")
+            return true
         } catch {
             logger.error("Record-only: \(error.localizedDescription)")
             update { next in
@@ -523,6 +524,7 @@ class WatchLoop {
                 title: "Record-only output failed",
                 body: error.localizedDescription,
             )
+            return false
         }
     }
 
